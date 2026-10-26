@@ -1,0 +1,9 @@
+{
+  "appId": "com.localify.crimson",
+  "appName": "Localify Crimson",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "android": {
+    "allowMixedContent": false
+  }
+}

@@ -1,0 +1,479 @@
+/* Localify Crimson — фирменный слой поверх перекрашенной темы.
+   Здесь только цвет, свет, фон и текстуры. Геометрия макета (высота панели,
+   высота строки списка, размеры обложек) намеренно не меняется: раскладку
+   проверяет npm run smoke, и она должна оставаться прежней.
+
+   Вид намеренно «грязный»: плёночное зерно, сажа, царапины, неровные разводы и
+   виньетка. Палитра — почти чёрная основа, кровь-багровый акцент и холодные
+   серые плоскости, как фигура в капюшоне в сумеречном зале.
+
+   Слои фона перечислены по порядку: сначала фактуры, потом градиенты света.
+   Важно следить за их числом: свойство background-repeat применяется по кругу,
+   поэтому там, где нужны не все повторы, список задан явно. */
+
+:root{
+  --bg:#080304;
+  --panel:#12090d;
+  --panel2:#180d12;
+  --panel3:#20121a;
+  --line:#2f181d;
+  --text:#f7eef0;
+  --text-strong:#fff5f6;
+  --text-body:#d8c4c8;
+  --text-soft:#a2898e;
+  --muted:#a2898e;
+  --accent:#e01f2c;
+  --accent-soft:rgba(224,31,44,.14);
+  --accent-strong:#ff8d9a;
+  --accent-glow:rgba(224,31,44,.32);
+  --crimson-deep:#4a0a12;
+  --crimson-ember:#ff5a4a;
+
+  /* --- фактуры (2 + 1 + 2 слоя) ------------------------------------------- */
+  /* Зерно: разреженные светлые и тёмные крупинки. Шум уходит в альфу
+     (последняя строка матрицы), а смещение подобрано так, чтобы крупинки были
+     редкими: иначе вместо плёнки получается «телевизионный снег». */
+  --tex-grain:
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='l'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/><feColorMatrix type='matrix' values='0 0 0 0 1  0 0 0 0 0.93  0 0 0 0 0.95  0.34 0.34 0.34 0 -0.58'/></filter><rect width='140' height='140' filter='url(%23l)'/></svg>"),
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='dk'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' seed='4' stitchTiles='stitch'/><feColorMatrix type='matrix' values='0 0 0 0 0.03  0 0 0 0 0.005  0 0 0 0 0.02  0.30 0.30 0.30 0 -0.55'/></filter><rect width='140' height='140' filter='url(%23dk)'/></svg>");
+  /* крупная сажа и разводы */
+  --tex-dirt:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='520' height='520'><filter id='d'><feTurbulence type='fractalNoise' baseFrequency='0.013' numOctaves='4' seed='9'/><feColorMatrix type='matrix' values='0 0 0 0 0.10  0 0 0 0 0.012  0 0 0 0 0.03  0 0 0 -1.35 0.62'/></filter><rect width='520' height='520' filter='url(%23d)'/></svg>");
+  /* царапины: редкие тёмные волоски и почти невидимые светлые */
+  --tex-scratch:
+    repeating-linear-gradient(102deg, rgba(255,228,232,.010) 0 1px, transparent 1px 61px),
+    repeating-linear-gradient(14deg, rgba(0,0,0,.13) 0 1px, transparent 1px 53px);
+}
+
+/* --- Основа: тлеющий багровый свет, разводы и зерно -------------------------
+   Вся атмосфера лежит на .app-shell — это непрокручиваемый контейнер. Раньше
+   слои висели на .main, который сам является прокруткой, и вместе с дрожью
+   зерна это перерисовывало всю область при каждом кадре: список «подлагивал».
+   Теперь при прокрутке перерисовываются только строки поверх сплошного фона. */
+body{background:#080304}
+.app-shell{
+  background-color:#060203!important;
+  background-image:
+    var(--tex-grain),
+    var(--tex-dirt),
+    repeating-linear-gradient(112deg, rgba(224,31,44,.035) 0 1px, transparent 1px 9px),
+    radial-gradient(900px 480px at 34% -14%, rgba(224,31,44,.16), transparent 62%),
+    radial-gradient(700px 400px at 112% 4%, rgba(120,10,24,.18), transparent 60%),
+    radial-gradient(1100px 660px at 62% 118%, rgba(74,10,18,.24), transparent 70%),
+    radial-gradient(320px 220px at 12% 76%, rgba(20,2,6,.55), transparent 72%),
+    radial-gradient(420px 260px at 96% 34%, rgba(60,6,14,.30), transparent 74%)!important;
+}
+/* Сплошной фон и z-index выше слоя атмосферы: прокрутка не перерисовывает фактуры. */
+.main{background-color:transparent!important;background-image:none!important;z-index:1}
+
+/* Виньетка, царапины, сажа и зерно — одним статичным слоем под содержимым.
+   Анимации здесь нет намеренно: дрожь зерна читалась как лаги. */
+.app-shell::after{
+  content:"";position:absolute;inset:0;z-index:0;pointer-events:none;opacity:.45;
+  background-image:
+    radial-gradient(118% 84% at 62% 32%, transparent 36%, rgba(0,0,0,.80) 100%),
+    radial-gradient(90% 60% at 62% 110%, rgba(224,31,44,.10), transparent 60%),
+    var(--tex-scratch),
+    var(--tex-dirt);
+  background-size:100% 100%, 100% 100%, auto, auto, auto;
+  background-repeat:no-repeat, no-repeat, repeat, repeat, repeat;
+}
+
+/* --- Каркас: те же складки и грязь, что на накидке ------------------------- */
+.windowbar{
+  background-color:#0a0206!important;
+  background-image:var(--tex-grain), linear-gradient(180deg,#0f0408,#0a0206)!important;
+  border-bottom-color:rgba(224,31,44,.20)!important;
+}
+.sidebar{
+  background-color:#070203!important;
+  background-image:
+    var(--tex-grain),
+    var(--tex-dirt),
+    repeating-linear-gradient(112deg, rgba(224,31,44,.05) 0 1px, transparent 1px 7px),
+    linear-gradient(180deg,#0d0408,#070203 72%)!important;
+  border-right-color:rgba(224,31,44,.16)!important;
+  box-shadow:inset -18px 0 34px rgba(0,0,0,.55);
+}
+.topbar{
+  background-color:rgba(6,2,4,.74)!important;
+  background-image:var(--tex-grain)!important;
+  border-bottom-color:rgba(224,31,44,.16)!important;
+}
+.player{
+  background-color:#090305!important;
+  background-image:
+    var(--tex-grain),
+    var(--tex-dirt),
+    repeating-linear-gradient(112deg, rgba(224,31,44,.04) 0 1px, transparent 1px 9px),
+    linear-gradient(0deg,#0d0408,#090305)!important;
+  border-top-color:rgba(224,31,44,.22)!important;
+  box-shadow:0 -10px 34px rgba(0,0,0,.5), 0 -1px 0 rgba(224,31,44,.10)!important;
+}
+
+/* --- Плоскости и карточки: worn-края и сажа -------------------------------
+   У карточек внутри списка оставлена только мягкая сажа (один слой): они
+   перерисовываются при прокрутке, и чем меньше слоёв, тем плавнее список. */
+.hero,.music-card,.settings-card,.album-card,.album-detail-main{
+  background-image:var(--tex-dirt)!important;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.028), inset 0 0 44px rgba(0,0,0,.45);
+}
+.track-header,.search,.toast,.search-suggestions,.track-popover,.float-card{
+  background-image:var(--tex-dirt)!important;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.028), inset 0 0 44px rgba(0,0,0,.45);
+}
+.hero{
+  background-color:#0a0306!important;
+  background-image:
+    var(--tex-dirt),
+    repeating-linear-gradient(112deg, rgba(224,31,44,.055) 0 1px, transparent 1px 8px),
+    linear-gradient(140deg,#14060a 0%,#0a0306 62%,#080304 100%)!important;
+  border-color:rgba(224,31,44,.22)!important;
+}
+.hero:after{background:radial-gradient(circle, rgba(224,31,44,.18), transparent 70%)!important}
+.hero h1 span{color:var(--accent-strong);text-shadow:0 0 22px rgba(224,31,44,.5)}
+.music-card,.settings-card,.album-card,.album-detail-main{background-color:#0f0709!important;border-color:rgba(224,31,44,.16)!important}
+.music-card:hover{background-color:#160b10!important;box-shadow:0 12px 30px rgba(0,0,0,.5), 0 0 0 1px rgba(224,31,44,.22)!important}
+.track-header{background-color:rgba(10,4,6,.95)!important;border-bottom-color:rgba(224,31,44,.20)!important}
+.track:hover{background:rgba(46,12,19,.42)!important}
+.search{background-color:rgba(8,3,5,.88)!important;border-color:rgba(224,31,44,.18)!important}
+.search:focus-within{border-color:rgba(224,31,44,.46)!important;box-shadow:0 0 0 3px rgba(224,31,44,.10)!important}
+.search-suggestions,.track-popover,.float-card{background-color:#1a0e12!important}
+/* Уведомления: фон тёмный (см. ниже), поэтому текст обязан быть светлым.
+   Раньше здесь оставался тёмный цвет из светлой темы — получалось чёрное на
+   чёрном с контрастом около 1. */
+.toast{background-color:#160a0f!important;color:#ffe9ec!important;border:1px solid rgba(224,31,44,.34)!important;box-shadow:0 10px 30px rgba(0,0,0,.55), 0 0 24px rgba(224,31,44,.18)!important}
+dialog{
+  background-color:#140a0e!important;
+  background-image:var(--tex-grain), var(--tex-dirt)!important;
+  border:1px solid rgba(224,31,44,.22)!important;
+  box-shadow:0 30px 70px rgba(0,0,0,.7), inset 0 0 60px rgba(0,0,0,.5)!important;
+}
+dialog::backdrop{background:rgba(3,1,2,.82)}
+
+/* --- Свет: акцент светится, как глаза под капюшоном ------------------------ */
+.brand-mark{box-shadow:0 0 16px rgba(224,31,44,.35), inset 0 0 10px rgba(224,31,44,.28)}
+.brand-name{color:#ffe9ec;text-shadow:0 0 12px rgba(224,31,44,.35)}
+.nav-item.active{
+  background:linear-gradient(180deg, rgba(224,31,44,.025), rgba(224,31,44,.13))!important;
+  color:#fff2f4!important;
+  box-shadow:0 0 22px rgba(224,31,44,.16)!important;
+}
+.nav-item.active::after{
+  content:"";
+  position:absolute;
+  left:50%;
+  bottom:1px;
+  transform:translateX(-50%);
+  width:22px;
+  height:3px;
+  border-radius:3px;
+  background:var(--accent);
+  box-shadow:0 0 8px rgba(224,31,44,.62);
+}
+.nav-item:hover{background:rgba(224,31,44,.09)!important}
+.primary{box-shadow:0 0 20px rgba(224,31,44,.30), inset 0 1px 0 rgba(255,255,255,.18)}
+.secondary:hover,.ghost-wide:hover{border-color:rgba(224,31,44,.42)!important;color:#ffe9ec!important}
+.play{
+  background:radial-gradient(circle at 50% 42%, #fff7f8 0 40%, #ffd6db 68%, #ff97a3 100%)!important;
+  color:#2b0207!important;
+  box-shadow:0 0 18px rgba(255,143,154,.35), 0 0 42px rgba(224,31,44,.30), inset 0 0 8px rgba(255,255,255,.75)!important;
+}
+.progress{background:#1e1114!important}
+.progress span{box-shadow:0 0 12px rgba(224,31,44,.55)!important}
+.track.is-playing{box-shadow:inset 2px 0 0 var(--accent), inset 0 0 34px rgba(224,31,44,.10)!important}
+.playing-eq i{background:linear-gradient(180deg,#ffd6db,#e01f2c);box-shadow:0 0 8px rgba(224,31,44,.75)!important}
+.row-cover,.card-cover{border-color:rgba(224,31,44,.18)!important;background-color:#130a0e!important}
+
+/* --- Мелочи, которые держат общий тон ------------------------------------- */
+/* Визуализатор: наложение screen заставляло пересобирать слой при каждой
+   перерисовке, поэтому включаем обычный режим и компенсируем плотностью. */
+.audio-visualizer{mix-blend-mode:normal!important;opacity:.9!important}
+.mini-cover{
+  border-color:rgba(224,31,44,.24)!important;background-color:#130a0e!important;
+  box-shadow:0 0 24px rgba(224,31,44,.38), 0 0 4px rgba(255,150,160,.55)!important;
+}
+.album-cover,.album-detail-cover{box-shadow:inset 0 0 0 1px rgba(224,31,44,.18), 0 10px 26px rgba(0,0,0,.5)}
+.playlist-detail-cover,.home-resume-cover{box-shadow:0 0 26px rgba(224,31,44,.28), inset 0 0 0 1px rgba(224,31,44,.20)}
+.eyebrow{color:#c98089!important;letter-spacing:.17em}
+/* Счётчики в списке жанров были почти нечитаемыми (контраст ~2.7). */
+.genre-count{color:#bda7ac!important}
+.page-head h1,.section-head h2{text-shadow:0 1px 0 rgba(0,0,0,.6), 0 0 26px rgba(224,31,44,.20)}
+.storage-card,.settings-card.danger-card{border-color:rgba(224,31,44,.20)!important}
+.switch:checked,.setting-switch input:checked{background:linear-gradient(180deg,#ff3a49,#b8141f)!important;box-shadow:0 0 12px rgba(224,31,44,.45)!important}
+
+/* Кольцо фокуса: Chromium берёт его из системного акцента Windows (у автора он
+   золотой и выбивался из темы), поэтому задаём собственный багровый. */
+:focus-visible{outline-color:#ff7a86!important}
+@media(prefers-reduced-motion:reduce){.main::before{animation:none}}
+
+
+/* Mobile performance: replace SVG turbulence and blurred translucent panels with static colours. */
+:root { --tex-grain: none; --tex-dirt: none; }
+body {
+  background-image: radial-gradient(900px 480px at 34% -14%, rgba(224,31,44,.13), transparent 68%),
+    radial-gradient(680px 520px at 100% 58%, rgba(82,8,20,.14), transparent 70%) !important;
+}
+#player:not(.player-fullscreen) {
+  background-color: rgba(9,3,5,.99) !important;
+  background-image: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+.bottom-nav {
+  background-color: rgba(7,2,4,.99) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* The mini-player expands in place, keeping one audio element and one set of controls. */
+.full-player-top { display: none; }
+#player .mini-cover { touch-action: pan-y; user-select: none; -webkit-user-select: none; }
+#player.player-fullscreen {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 100 !important;
+  display: flex !important;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: clamp(14px, 3vh, 28px);
+  width: 100% !important;
+  max-width: none !important;
+  height: auto !important;
+  margin: 0 !important;
+  padding: calc(26px + env(safe-area-inset-top, 0px)) clamp(18px, 5vw, 34px) calc(22px + env(safe-area-inset-bottom, 0px)) !important;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background-color: #080304 !important;
+  background-image: radial-gradient(520px 460px at 50% 28%, rgba(224,31,44,.16), transparent 75%),
+    linear-gradient(180deg, #0a0305 0%, #080304 65%, #100307 100%) !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  overscroll-behavior: contain;
+}
+#player.player-fullscreen .full-player-top {
+  position: absolute;
+  top: calc(12px + env(safe-area-inset-top, 0px));
+  left: clamp(18px, 5vw, 34px);
+  right: clamp(18px, 5vw, 34px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 38px;
+}
+.full-player-close {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 0 9px;
+  color: #e7cbd0;
+  background: transparent;
+  border: 0;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.full-player-close svg { width: 22px; height: 22px; }
+.full-player-brand { color: #a78289; font-size: 9px; font-weight: 850; letter-spacing: .16em; }
+.full-player-brand span { color: #ff8d9a; }
+.full-player-top-spacer { width: 64px; }
+#player.player-fullscreen .player-track-row {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: clamp(16px, 3vh, 26px);
+  width: 100%;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+#player.player-fullscreen .mini-cover {
+  width: min(76vw, 42vh, 420px);
+  height: min(76vw, 42vh, 420px);
+  margin: 0 auto;
+  border-radius: min(30px, 7vw);
+  overflow: hidden;
+  font-size: clamp(50px, 12vw, 94px);
+  box-shadow: 0 16px 48px rgba(0,0,0,.5), 0 0 25px rgba(224,31,44,.16) !important;
+  cursor: grab;
+}
+#player.player-fullscreen .mini-cover:active { cursor: grabbing; }
+#player.player-fullscreen .now-playing { width: 100%; flex: 0 1 auto; text-align: center; }
+#player.player-fullscreen .now-label { font-size: 9px; letter-spacing: .18em; }
+#player.player-fullscreen .now-title {
+  margin-top: 9px;
+  color: #fff2f4;
+  font-size: clamp(18px, 5vw, 24px);
+  line-height: 1.25;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: unset;
+  overflow-wrap: anywhere;
+}
+#player.player-fullscreen .now-artist {
+  margin-top: 7px;
+  color: #b49ba1;
+  font-size: 13px;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: unset;
+}
+#player.player-fullscreen .timeline {
+  width: 100%;
+  flex: 0 0 auto;
+  gap: 11px;
+  margin: 0;
+  font-size: 10px;
+  color: #ae9399;
+}
+#player.player-fullscreen .timeline input { height: 18px; accent-color: #f34b5a; }
+#player.player-fullscreen .player-controls {
+  width: 100%;
+  height: auto;
+  min-height: 54px;
+  flex: 0 0 auto;
+  gap: clamp(14px, 5vw, 38px);
+}
+#player.player-fullscreen .control-button { width: 40px; height: 42px; }
+#player.player-fullscreen .control-button svg { width: 22px; height: 22px; }
+#player.player-fullscreen .play-button { width: 58px; height: 58px; }
+#player.player-fullscreen .play-button svg { width: 25px; height: 25px; }
+#player.player-fullscreen .control-button.selected svg { filter: none; }
+body.player-overlay-open { overflow: hidden; }
+body.player-overlay-open .bottom-nav { visibility: hidden; }
+@media (max-height: 620px) {
+  #player.player-fullscreen { gap: 12px; padding-top: calc(54px + env(safe-area-inset-top, 0px)) !important; }
+  #player.player-fullscreen .player-track-row { flex-direction: row; justify-content: flex-start; gap: 18px; }
+  #player.player-fullscreen .mini-cover { width: min(42vw, 48vh, 310px); height: min(42vw, 48vh, 310px); flex: 0 0 auto; }
+  #player.player-fullscreen .now-playing { min-width: 0; text-align: left; }
+  #player.player-fullscreen .now-title { font-size: clamp(16px, 4vh, 22px); }
+  #player.player-fullscreen .now-artist { font-size: 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #player.player-fullscreen { scroll-behavior: auto; }
+}
+
+
+/* Playlists and queue actions */
+.library-heading-actions { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:8px; }
+.queue-current-button { margin:0; min-height:34px; padding:0 10px; border-radius:10px; font-size:10px; }
+.playlists-section { margin-top:28px; min-height:300px; }
+.playlist-page-heading { align-items:center; }
+.create-playlist-button { margin:0; min-height:40px; white-space:nowrap; }
+.playlist-grid { display:grid; grid-template-columns:1fr; gap:10px; margin-top:8px; }
+.playlist-card { min-width:0; overflow:hidden; border:1px solid rgba(224,31,44,.18); border-radius:17px; background:rgba(15,7,9,.92); box-shadow:inset 0 0 24px rgba(0,0,0,.18); }
+.playlist-card-open { display:flex; align-items:center; gap:12px; width:100%; padding:13px; color:inherit; text-align:left; border:0; background:transparent; cursor:pointer; }
+.playlist-card-art { display:grid; place-items:center; flex:0 0 auto; width:50px; height:50px; border:1px solid rgba(224,31,44,.27); border-radius:13px; background:linear-gradient(145deg,#45111c,#12070b); color:#ff9ba5; font-size:25px; }
+.playlist-card-copy { display:flex; flex:1; flex-direction:column; min-width:0; gap:5px; }
+.playlist-card-copy b { color:#fff1f3; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.playlist-card-copy small { color:#a2898e; font-size:10px; }
+.playlist-card-arrow { color:#c47883; font-size:26px; }
+.playlist-card-actions { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:0 12px 12px; }
+.playlist-card-actions button { min-height:32px; margin:0; padding:0 9px; font-size:10px; }
+.playlist-card-actions button[data-playlist-action="rename"],.playlist-card-actions button[data-playlist-action="delete"] { min-width:32px; padding:0 7px; font-size:15px; }
+.playlist-detail-heading { display:flex; flex-direction:column; align-items:stretch; gap:12px; margin:0 0 16px; }
+.playlist-back-button { align-self:flex-start; min-height:36px; margin:0; padding:0 10px; font-size:11px; }
+.playlist-detail-copy h3 { margin:0; color:#fff1f3; font-size:22px; overflow-wrap:anywhere; }
+.playlist-detail-copy span { display:block; margin-top:5px; color:#a2898e; font-size:11px; }
+.playlist-detail-actions { display:flex; flex-wrap:wrap; gap:7px; }
+.playlist-detail-actions button { min-height:38px; margin:0; padding:0 11px; font-size:11px; }
+.playlist-track-list { margin-top:10px; }
+.playlist-dialog { width:min(92vw,430px); max-width:calc(100vw - 24px); padding:0; border:1px solid rgba(224,31,44,.3); border-radius:19px; color:#f7eef0; background:#12070b; box-shadow:0 28px 80px rgba(0,0,0,.65); }
+.playlist-dialog::backdrop { background:rgba(3,1,2,.8); backdrop-filter:blur(2px); }
+.playlist-dialog-form { padding:20px; }
+.playlist-dialog-form h2 { margin:0; font-size:20px; }
+.playlist-dialog-form p { margin:8px 0 15px; color:#ae9399; font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
+.playlist-dialog-form input,.playlist-dialog-form select { display:block; width:100%; min-height:44px; padding:0 12px; color:#fff0f2; background:#080304; border:1px solid rgba(224,31,44,.26); border-radius:11px; font:inherit; font-size:13px; }
+.playlist-dialog-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:7px; margin-top:17px; }
+.playlist-dialog-actions button { min-height:38px; margin:0; padding:0 10px; font-size:11px; }
+.playlist-dialog-actions button:disabled { opacity:.45; }
+@media(min-width:520px){ .playlist-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.playlist-detail-heading{gap:14px}.playlist-detail-actions{gap:9px} }
+@media(max-width:390px){ .library-heading-actions{max-width:60%}.queue-current-button{font-size:9px;padding:0 8px}.playlist-detail-actions button{flex:1 1 auto}.playlist-dialog-form{padding:16px} }
+
+
+/* Keep track actions recognizable at a glance: queue list vs. playlist document. */
+.track-actions .playlist-add-action svg { stroke-width: 1.7; }
+.track-actions .playlist-add-action { color: #d998a4; }
+.track-actions [data-action="enqueue"] { color: #ff8d9a; }
+
+/* Focus the home screen on the music collection, without the introductory media-library hero. */
+.library-section { margin-top: 0 !important; }
+
+/* Compact mini-player: artwork and track info on the left, one prominent action on the right. */
+#player:not(.player-fullscreen) {
+  min-height: 78px;
+  padding: 10px 14px !important;
+  overflow: hidden;
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-user-select: none;
+}
+#player:not(.player-fullscreen) .full-player-top,
+#player:not(.player-fullscreen) .timeline,
+#player:not(.player-fullscreen) .player-controls .control-button {
+  display: none !important;
+}
+#player:not(.player-fullscreen) .player-track-row {
+  min-height: 58px;
+  gap: 12px;
+  padding-right: 62px;
+}
+#player:not(.player-fullscreen) .mini-cover {
+  width: 58px;
+  height: 58px;
+  flex-basis: 58px;
+  border-radius: 14px;
+  font-size: 28px;
+  cursor: pointer;
+  touch-action: pan-y;
+}
+#player:not(.player-fullscreen) .now-playing { min-width: 0; }
+#player:not(.player-fullscreen) .now-label { display: none; }
+#player:not(.player-fullscreen) .now-title {
+  margin-top: 0;
+  font-size: 13px;
+  line-height: 1.35;
+}
+#player:not(.player-fullscreen) .now-artist {
+  margin-top: 5px;
+  font-size: 10px;
+}
+#player:not(.player-fullscreen) .player-controls {
+  position: absolute;
+  top: 50%;
+  right: 12px;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 50px;
+  height: 50px;
+  gap: 0;
+  pointer-events: none;
+}
+#player:not(.player-fullscreen) .play-button {
+  pointer-events: auto;
+  width: 48px;
+  height: 48px;
+  flex: 0 0 48px;
+  border-radius: 50%;
+  box-shadow: 0 0 20px rgba(224,31,44,.3), 0 4px 12px rgba(0,0,0,.3);
+}
+#player:not(.player-fullscreen) .play-button svg { width: 23px; height: 23px; }
+#player.player-fullscreen .player-controls {
+  position: static;
+  top: auto;
+  right: auto;
+  transform: none;
+  pointer-events: auto;
+}
+#playerCover:focus-visible { outline: 2px solid #ff7a86; outline-offset: 4px; }
+
+/* Horizontal swipe on a song opens the playlist chooser; vertical movement remains scrollable. */
+#trackList .track-row,
+#playlistContent .track-row { touch-action: pan-y; }

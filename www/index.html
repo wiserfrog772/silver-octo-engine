@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111013">
+  <meta name="color-scheme" content="dark">
+  <title>Localify Crimson</title>
+  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./crimson-theme.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark"><img src="./assets/mark.png" alt="Localify Crimson"></div>
+        <div><div class="brand-name">LOCALIFY <span>CRIMSON</span></div><div class="brand-caption">ТВОЯ МУЗЫКА. ТВОЁ УСТРОЙСТВО.</div></div>
+      </div>
+      <button id="importTop" class="icon-button import-top" aria-label="Добавить аудиофайлы" title="Добавить аудиофайлы">
+        <svg viewBox="0 0 24 24"><path d="M12 15V3m0 0L7.5 7.5M12 3l4.5 4.5M4 14.5v4A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5v-4"/></svg>
+      </button>
+    </header>
+
+    <main>
+      <section id="librarySection" class="library-section">
+        <div class="section-heading library-heading">
+          <div><div class="eyebrow">ТВОЯ КОЛЛЕКЦИЯ</div><h2 id="sectionTitle">Моя музыка</h2></div>
+          <div class="library-heading-actions"><div class="track-count" id="trackCount">0 треков</div><button id="queueFromCurrent" class="secondary-button queue-current-button" type="button">В очередь от текущего</button></div>
+        </div>
+        <label class="search-box" for="searchInput">
+          <svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4 4"/></svg>
+          <input id="searchInput" type="search" placeholder="Найти трек или исполнителя" autocomplete="off">
+          <kbd>⌕</kbd>
+        </label>
+        <div id="trackList" class="track-list" aria-live="polite"></div>
+      </section>
+
+      <section id="playlistsSection" class="playlists-section hidden" aria-label="Музыкальные плейлисты">
+        <div class="section-heading playlist-page-heading">
+          <div><div class="eyebrow">ТВОИ ПОДБОРКИ</div><h2>Плейлисты</h2></div>
+          <button id="createPlaylist" class="primary-button create-playlist-button" type="button">＋ Создать</button>
+        </div>
+        <div id="playlistContent"></div>
+      </section>
+
+      <section id="settingsSection" class="settings-section hidden" aria-label="Настройки медиатеки">
+        <div class="section-heading">
+          <div><div class="eyebrow">НАСТРОЙКИ ХРАНИЛИЩА</div><h2>Настройки</h2></div>
+        </div>
+        <article class="settings-card">
+          <div class="settings-card-title"><span class="settings-symbol">♫</span><div><h3>Источник медиатеки</h3><p>Выбери папку с музыкой. Скачанные в Localify треки автоматически добавляются в медиатеку, а копии можно экспортировать в выбранную папку.</p></div></div>
+          <div id="libraryFolderSummary" class="settings-status">Папка не выбрана. Используется медиатека, добавленная вручную или скачанная в приложении.</div>
+          <div class="settings-actions">
+            <button id="chooseLibraryFolder" type="button" class="primary-button">Выбрать папку</button>
+            <button id="refreshLibraryFolder" type="button" class="secondary-button">Пересканировать</button>
+          </div>
+        </article>
+        <article class="settings-card">
+          <div class="settings-card-title"><span class="settings-symbol">↓</span><div><h3>Папка загрузок</h3><p>После скачивания Localify сохраняет трек во внутренней медиатеке и копирует его в выбранную папку Android.</p></div></div>
+          <div id="downloadFolderSummary" class="settings-status">По умолчанию: приватная папка приложения Localify.</div>
+          <div class="settings-actions">
+            <button id="chooseDownloadFolder" type="button" class="primary-button">Выбрать папку загрузок</button>
+            <button id="resetDownloadFolder" type="button" class="secondary-button">Папка по умолчанию</button>
+          </div>
+        </article>
+        <article class="settings-card">
+          <div class="settings-card-title"><span class="settings-symbol">⇅</span><div><h3>Скачивание аудио</h3><p>Localify автоматически выбирает лучшую доступную аудиодорожку. Если её не удаётся скачать, приложение преобразует аудио в MP3. Видео не загружается.</p></div></div>
+        </article>
+        <article class="settings-card">
+          <div class="settings-card-title"><span class="settings-symbol">!</span><div><h3>Диагностика закрытия приложения</h3><p>Если приложение неожиданно закроется, журнал сохранит Java-ошибки, ошибки интерфейса и состояние фоновой службы при остановке. Журнал хранится только на устройстве.</p></div></div>
+          <div id="diagnosticStatus" class="settings-status">Журнал пока не загружен.</div>
+          <div class="settings-actions">
+            <button id="copyDiagnosticLog" type="button" class="primary-button">Скопировать журнал</button>
+            <button id="clearDiagnosticLog" type="button" class="secondary-button">Очистить журнал</button>
+          </div>
+          <textarea id="diagnosticLogText" class="diagnostic-log hidden" readonly aria-label="Журнал диагностики" spellcheck="false"></textarea>
+        </article>
+        <p class="settings-footnote">Системный выбор папки доступен в установленном APK. При выборе каталога Android попросит подтвердить разрешение.</p>
+      </section>
+
+      <section id="onlineSection" class="online-section hidden">
+        <div class="section-heading online-heading">
+          <div><div class="eyebrow">ОНЛАЙН ПОИСК</div><h2>Музыка из YouTube</h2></div>
+          <span class="track-count">yt-dlp</span>
+        </div>
+        <p class="online-intro">Ищи музыку, слушай превью и скачивай аудио прямо в Localify. Готовый трек автоматически добавляется в медиатеку.</p>
+        <form id="youtubeSearchForm" class="youtube-search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4 4"/></svg>
+          <input id="youtubeQuery" type="search" placeholder="Название трека или исполнитель" autocomplete="off" maxlength="180">
+          <button type="submit" id="youtubeSearchButton">Найти</button>
+        </form>
+        <div id="youtubeStatus" class="youtube-status" role="status">Подготовка yt-dlp…</div>
+        <div id="youtubeResults" class="youtube-results" aria-live="polite"></div>
+        <div class="cookies-panel">
+          <div class="cookies-icon"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 3v6l4 2"/><path d="M16.5 3.5h4v4"/></svg></div>
+          <div class="cookies-copy"><b>Доступ к YouTube</b><span id="cookiesStatus">Если YouTube просит войти в аккаунт, импортируй cookies.txt в формате Netscape.</span></div>
+          <div class="cookies-actions"><button id="importCookies" class="secondary-button" type="button">Импорт cookies.txt</button><button id="clearCookies" class="ghost-button" type="button">Очистить</button></div>
+        </div>
+        <p class="provider-footnote">Поиск, потоковое воспроизведение и загрузка выполняются встроенным yt-dlp внутри APK. Файлы сохраняются в медиатеку Localify; при необходимости выбери папку экспорта в настройках. Если YouTube требует авторизацию, импортируй cookies.txt выше.</p>
+      </section>
+    </main>
+
+    <footer class="app-note"><span class="note-mark">✦</span> Слушай локальную музыку. Папки и загрузки настраиваются в параметрах.</footer>
+  </div>
+
+  <nav class="bottom-nav" aria-label="Разделы">
+    <button class="nav-item active" data-view="library">
+      <img src="./assets/nav/library.svg" alt=""><span>Музыка</span>
+    </button>
+    <button class="nav-item" data-view="playlists">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h7"/><path d="m17 15 4 3-4 3z"/></svg><span>Плейлисты</span>
+    </button>
+    <button class="nav-item" data-view="youtube">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 12a10 10 0 1 1-3-7"/><path d="M22 3v6h-6"/><path d="m10 8 6 4-6 4z"/></svg><span>YouTube</span>
+    </button>
+    <button class="nav-item" data-view="settings">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 1.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.1h-2.6v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1-1.8-1.8.1-.1A1.7 1.7 0 0 0 8 15a1.7 1.7 0 0 0-1.5-1H6.4v-2.6h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 1.8-1.8.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.5v-.1h2.6v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1 1.8 1.8-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.5 1h.1V14h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg><span>Настройки</span>
+    </button>
+    <button class="nav-item" data-view="queue">
+      <svg viewBox="0 0 24 24"><path d="M4 6h12M4 12h12M4 18h7M19 14v7m-3.5-3.5h7"/></svg><span>Очередь</span><span id="queueBadge" class="nav-badge hidden">0</span>
+    </button>
+  </nav>
+
+  <section id="player" class="player-dock" aria-label="Аудиоплеер" aria-expanded="false">
+    <div class="full-player-top">
+      <button id="closeFullPlayer" class="full-player-close" type="button" aria-label="Свернуть полноэкранный плеер">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><span>Свернуть</span>
+      </button>
+      <div class="full-player-brand">LOCALIFY <span>CRIMSON</span></div>
+      <span class="full-player-top-spacer" aria-hidden="true"></span>
+    </div>
+    <div class="player-track-row">
+      <div id="playerCover" class="mini-cover" role="button" tabindex="0" aria-label="Открыть полноэкранный плеер"><span>♫</span></div>
+      <div class="now-playing"><div class="now-label">СЕЙЧАС ИГРАЕТ</div><div id="nowTitle" class="now-title">Выбери свой первый трек</div><div id="nowArtist" class="now-artist">Твоя музыка ждёт</div></div>
+
+    </div>
+    <div class="timeline">
+      <span id="elapsed">0:00</span><input id="seek" type="range" min="0" max="1000" value="0" aria-label="Позиция воспроизведения" disabled><span id="duration">0:00</span>
+    </div>
+    <div class="player-controls">
+      <button id="shuffle" class="control-button subtle" aria-label="Случайный порядок" title="Случайный порядок"><svg viewBox="0 0 24 24"><path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg></button>
+      <button id="previous" class="control-button" aria-label="Предыдущий трек" title="Предыдущий"><svg viewBox="0 0 24 24"><path d="M6 5v14M19 6 8 12l11 6z"/></svg></button>
+      <button id="playPause" class="play-button" aria-label="Воспроизвести" title="Воспроизвести"><svg id="playIcon" viewBox="0 0 24 24"><path d="m8 5 12 7-12 7z"/></svg></button>
+      <button id="next" class="control-button" aria-label="Следующий трек" title="Следующий"><svg viewBox="0 0 24 24"><path d="M18 5v14M5 6l11 6-11 6z"/></svg></button>
+      <button id="repeat" class="control-button subtle" aria-label="Повтор" title="Повтор выключен"><svg viewBox="0 0 24 24"><path d="m17 2 4 4-4 4M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4M21 13v2a3 3 0 0 1-3 3H3"/></svg><span id="repeatDot" class="control-dot hidden"></span></button>
+    </div>
+    <audio id="audio" preload="metadata"></audio>
+  </section>
+
+  <dialog id="playlistNameDialog" class="playlist-dialog">
+    <form id="playlistNameForm" class="playlist-dialog-form">
+      <h2 id="playlistNameDialogTitle">Новый плейлист</h2>
+      <p>Дай подборке короткое название.</p>
+      <input id="playlistNameInput" type="text" maxlength="60" placeholder="Например, Избранное" required autocomplete="off">
+      <div class="playlist-dialog-actions"><button id="cancelPlaylistName" class="secondary-button" type="button">Отмена</button><button class="primary-button" type="submit">Сохранить</button></div>
+    </form>
+  </dialog>
+  <dialog id="addToPlaylistDialog" class="playlist-dialog">
+    <form id="addToPlaylistForm" class="playlist-dialog-form">
+      <h2>Добавить в плейлист</h2>
+      <p id="addToPlaylistTrackName">Выбери, куда добавить трек.</p>
+      <select id="playlistTargetSelect" required></select>
+      <div class="playlist-dialog-actions"><button id="createFromAddPlaylist" class="secondary-button" type="button">＋ Новый</button><button id="cancelAddToPlaylist" class="secondary-button" type="button">Отмена</button><button class="primary-button" type="submit">Добавить</button></div>
+    </form>
+  </dialog>
+  <input id="filePicker" class="visually-hidden" type="file" accept="audio/*,.mp3,.m4a,.aac,.ogg,.opus,.wav,.flac,.webm" multiple>
+  <input id="cookiesPicker" class="visually-hidden" type="file" accept=".txt,text/plain">
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="./native-bridge.bundle.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
