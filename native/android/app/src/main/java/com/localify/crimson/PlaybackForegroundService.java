@@ -492,8 +492,13 @@ public final class PlaybackForegroundService extends MediaSessionService {
             player.clearMediaItems();
             queueSignature = "";
             currentTrackId = "";
+            active = false;
             getSharedPreferences(PREFS, MODE_PRIVATE).edit().clear().apply();
             publishNativeState();
+            // The service may have been promoted while handling an empty queue. Remove the
+            // temporary notification and stop instead of leaving an idle foreground service.
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            stopSelf();
             return;
         }
 
