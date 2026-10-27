@@ -1,5 +1,9 @@
 package com.localify.crimson;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.content.pm.ServiceInfo;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
@@ -32,6 +36,7 @@ import java.util.List;
 public final class PlaybackForegroundService extends MediaSessionService {
     public static final String EXTRA_PLAYING = "playing";
     private static final int NOTIFICATION_ID = 7402;
+    private static final String NOTIFICATION_CHANNEL_ID = "localify_music_playback";
     private static final String PREFS = "localify_native_playback";
     private static final String PREF_QUEUE = "queueJson";
     private static final String PREF_CURRENT = "currentId";
@@ -112,6 +117,9 @@ public final class PlaybackForegroundService extends MediaSessionService {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // Android requires a foreground notification promptly after startForegroundService().
+        // Do this before MediaSessionService initialization or queue parsing.
+        promoteToForegroundImmediately();
         int serviceResult = super.onStartCommand(intent, flags, startId);
         if (intent == null) {
             android.content.SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
@@ -150,6 +158,39 @@ public final class PlaybackForegroundService extends MediaSessionService {
             handleActionInternal(action);
         }
         return serviceResult;
+    }
+
+    private void promoteToForegroundImmediately() {
+        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && manager != null
+            && manager.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null) {
+            NotificationChannel channel = new NotificationChannel(
+                NOTIFICATION_CHANNEL_ID, "Музыка Localify", NotificationManager.IMPORTANCE_LOW);
+            channel.setDescription("Управление воспроизведением музыки Localify");
+            channel.setShowBadge(false);
+            manager.createNotificationChannel(channel);
+        }
+
+        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+            ? new Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+            : new Notification.Builder(this).setPriority(Notification.PRIORITY_LOW);
+        Notification notification = builder
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle("Localify Crimson")
+            .setContentText("Подготовка воспроизведения…")
+            .setCategory(Notification.CATEGORY_TRANSPORT)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setOngoing(true)
+            .build();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+        } else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
+        PlaybackNotificationPlugin.logDiagnostic("SERVICE_FOREGROUND", "Foreground notification posted immediately");
     }
 
     @UnstableApi
@@ -368,11 +409,8 @@ public final class PlaybackForegroundService extends MediaSessionService {
             }
             if (context != null) {
                 fillSavedPlaybackState(context.getApplicationContext(), result);
-                // If the last state was playing, resume it through MediaSessionService after
-                // Android recreated the app process. Paused sessions stay idle and use no wake lock.
-                if (result.optBoolean("active", false) && result.optBoolean("playing", false)) {
-                    startFromSavedQueue(context, PlaybackNotificationPlugin.ACTION_PLAY, null);
-                }
+                // A state query must never launch a foreground service. Playback is resumed
+                // only by explicit transport actions or the MediaSession resumption callback.
             } else {
                 result.put("active", false);
             }
