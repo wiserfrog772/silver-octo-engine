@@ -53,7 +53,7 @@ public final class PlaybackForegroundService extends MediaSessionService {
     private MediaSession mediaSession;
     private String queueSignature = "";
     private String currentTrackId = "";
-    private boolean active = false;
+    private volatile boolean active = false;
 
     @Override
     public void onCreate() {
@@ -207,8 +207,11 @@ public final class PlaybackForegroundService extends MediaSessionService {
                          boolean playing, boolean shuffle, boolean repeat) {
         PlaybackForegroundService service = activeService == null ? null : activeService.get();
         if (service != null && service.player != null && service.mediaSession != null) {
-            service.active = true;
-            service.applyQueue(queueJson, currentId, positionMs, playing, shuffle, repeat);
+            service.runOnPlayerThread(() -> {
+                if (service.player == null || service.mediaSession == null) return;
+                service.active = true;
+                service.applyQueue(queueJson, currentId, positionMs, playing, shuffle, repeat);
+            });
             return;
         }
         Intent intent = new Intent(context.getApplicationContext(), PlaybackForegroundService.class);
@@ -236,6 +239,15 @@ public final class PlaybackForegroundService extends MediaSessionService {
         }
     }
 
+    private void runOnPlayerThread(Runnable action) {
+        if (action == null) return;
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            action.run();
+        } else {
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(action);
+        }
+    }
+
     private void clearPlayerQueue() {
         if (player == null) return;
         Runnable clear = () -> {
@@ -256,8 +268,15 @@ public final class PlaybackForegroundService extends MediaSessionService {
     static boolean handleAction(Context context, String action) {
         if (context == null || action == null) return false;
         PlaybackForegroundService service = activeService == null ? null : activeService.get();
-        if (service != null && service.player != null && service.player.getMediaItemCount() > 0) {
-            service.handleActionInternal(action);
+        if (service != null && service.player != null) {
+            service.runOnPlayerThread(() -> {
+                if (service.player == null) return;
+                if (service.player.getMediaItemCount() > 0) {
+                    service.handleActionInternal(action);
+                } else {
+                    startFromSavedQueue(context, action, null);
+                }
+            });
             return true;
         }
         return startFromSavedQueue(context, action, null);
@@ -265,19 +284,28 @@ public final class PlaybackForegroundService extends MediaSessionService {
 
     static boolean seekTo(long positionMs) {
         PlaybackForegroundService service = activeService == null ? null : activeService.get();
-        if (service == null || service.player == null || service.player.getMediaItemCount() == 0) return false;
-        service.player.seekTo(Math.max(0L, positionMs));
-        service.savePlaybackSnapshot();
-        service.publishNativeState();
+        if (service == null || service.player == null) return false;
+        service.runOnPlayerThread(() -> {
+            if (service.player == null || service.player.getMediaItemCount() == 0) return;
+            service.player.seekTo(Math.max(0L, positionMs));
+            service.savePlaybackSnapshot();
+            service.publishNativeState();
+        });
         return true;
     }
 
     static boolean seekTo(Context context, long positionMs) {
         PlaybackForegroundService service = activeService == null ? null : activeService.get();
-        if (service != null && service.player != null && service.player.getMediaItemCount() > 0) {
-            service.player.seekTo(Math.max(0L, positionMs));
-            service.savePlaybackSnapshot();
-            service.publishNativeState();
+        if (service != null && service.player != null) {
+            service.runOnPlayerThread(() -> {
+                if (service.player != null && service.player.getMediaItemCount() > 0) {
+                    service.player.seekTo(Math.max(0L, positionMs));
+                    service.savePlaybackSnapshot();
+                    service.publishNativeState();
+                } else {
+                    startFromSavedQueue(context, "seek", Math.max(0L, positionMs));
+                }
+            });
             return true;
         }
         return startFromSavedQueue(context, "seek", Math.max(0L, positionMs));
@@ -317,7 +345,9 @@ public final class PlaybackForegroundService extends MediaSessionService {
 
     static boolean hasPlayer() {
         PlaybackForegroundService service = activeService == null ? null : activeService.get();
-        return service != null && service.player != null && service.player.getMediaItemCount() > 0;
+        if (service == null || service.player == null) return false;
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) return service.active;
+        return service.player.getMediaItemCount() > 0;
     }
 
     static JSONObject playbackState() {
@@ -328,7 +358,11 @@ public final class PlaybackForegroundService extends MediaSessionService {
         PlaybackForegroundService service = activeService == null ? null : activeService.get();
         JSONObject result = new JSONObject();
         try {
-            if (service != null && service.player != null && service.player.getCurrentMediaItem() != null) {
+            // ExoPlayer must only be queried on its application thread. Plugin bridge calls
+            // run on CapacitorPlugins, so off-main queries use the last persisted snapshot.
+            if (service != null && service.player != null
+                && android.os.Looper.myLooper() == android.os.Looper.getMainLooper()
+                && service.player.getCurrentMediaItem() != null) {
                 service.fillState(result);
                 return result;
             }
