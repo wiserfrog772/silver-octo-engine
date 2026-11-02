@@ -152,3 +152,60 @@ test('интерфейс содержит поиск плейлистов, им�
   assert.match(html, /id="importCookies"/);
   assert.match(html, /id="clearCookies"/);
 });
+
+
+test('playlist ordering module passes syntax validation', () => {
+  execFileSync(process.execPath, ['--check', path.join(root, 'www/modules/playlist-order.mjs')], { stdio: 'pipe' });
+});
+
+test('playlist sorting is wired to persistence, touch drag-and-drop and active native queue sync', () => {
+  const app = read('www/app.js');
+  assert.match(app, /data-reorder-handle/);
+  assert.match(app, /pointerdown/);
+  assert.match(app, /pointermove/);
+  assert.match(app, /pointerup/);
+  assert.match(app, /persistPlaylistOrder\(playlist, nextIds, message\)/);
+  assert.match(app, /localStorage\.setItem\(STORAGE_KEYS\.playlists/);
+  assert.match(app, /setPlaybackPlaylist\(playlistId\)/);
+  assert.match(app, /refreshActivePlaylistPlayback\(playlist\)/);
+  assert.match(app, /syncNativePlayback\(true\)/);
+  assert.match(app, /window\.scrollBy/);
+  assert.match(app, /data-playlist-action="set-position"/);
+});
+
+test('компактное меню действий заменяет старую отдельную кнопку добавления в плейлист', () => {
+  const app = read('www/app.js');
+  const styles = read('www/crimson-theme.css');
+  assert.match(app, /track-context-menu/);
+  assert.match(app, /Добавить в плейлист/);
+  assert.doesNotMatch(app, /playlist-add-action/);
+  assert.match(app, /document\.querySelectorAll\('\.track-context-menu\[open\]/);
+  assert.match(styles, /\.track-context-popover/);
+});
+
+test('свайп добавляет только вправо, запоминает выбранный плейлист и не перехватывает сортировку', () => {
+  const app = read('www/app.js');
+  assert.match(app, /classifyTrackSwipe\(dx, dy\)/);
+  assert.match(app, /resolveSwipePlaylist\(state\.playlists, state\.quickAddPlaylistId, sourcePlaylistId\)/);
+  assert.match(app, /saveQuickAddPlaylist\(playlist\.id\)/);
+  assert.match(app, /\[data-reorder-handle\]/);
+  assert.match(app, /openAddToPlaylistDialog\(gesture\.trackId, sourcePlaylistId\)/);
+});
+
+test('полоска прогресса видна в компактном плеере и синхронизируется с локальным и нативным аудио', () => {
+  const app = read('www/app.js');
+  const styles = read('www/crimson-theme.css');
+  assert.match(app, /updateSeekVisual\(displayedElapsed, knownDuration\)/);
+  assert.match(app, /audio\.addEventListener\('timeupdate'/);
+  assert.match(app, /window\.CrimsonPlayback\.seekTo/);
+  assert.match(styles, /#player:not\(\.player-fullscreen\) \.timeline\s*\{\s*display: flex !important/s);
+  assert.match(styles, /::-webkit-slider-thumb/);
+});
+
+test('быстрое добавление свайпом можно отменить без удаления самой композиции', () => {
+  const app = read('www/app.js');
+  assert.match(app, /addTrackToPlaylist\(target\.id, gesture\.trackId, \{ undoable: true \}\)/);
+  assert.match(app, /showToast\(message, 'Отменить'/);
+  assert.match(app, /current\.trackIds\.splice\(index, 1\)/);
+  assert.match(app, /refreshActivePlaylistPlayback\(current\)/);
+});

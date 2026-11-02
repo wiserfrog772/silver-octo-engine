@@ -299,3 +299,56 @@ body{
   resize: vertical;
   overflow-wrap: anywhere;
 }
+
+/* Playlist ordering: a compact grip keeps drag-and-drop discoverable without
+   adding permanent up/down buttons to every row. */
+.playlist-track-row { position: relative; gap: 8px; }
+.playlist-reorder-handle {
+  width: 23px; min-width: 23px; height: 44px; padding: 0;
+  display: grid; place-items: center; flex: 0 0 auto;
+  border: 0; border-radius: 8px; background: transparent;
+  color: #a99ca5; font-size: 21px; line-height: 1; cursor: grab;
+  touch-action: none; user-select: none; -webkit-user-select: none;
+}
+.playlist-reorder-handle:active { color: #ff9aa5; cursor: grabbing; background: rgba(224,31,44,.12); }
+.playlist-track-position {
+  width: 20px; flex: 0 0 20px; color: #8e828b;
+  font-size: 10px; font-variant-numeric: tabular-nums; text-align: center;
+}
+.playlist-track-row.playlist-reorder-source {
+  opacity: .48; transform: scale(.985); border-color: rgba(255,138,145,.42);
+}
+.playlist-track-row.playlist-drop-before::before,
+.playlist-track-row.playlist-drop-after::after {
+  content: ""; position: absolute; z-index: 5; left: 5px; right: 5px;
+  height: 3px; border-radius: 4px; background: #ff7e8b;
+  box-shadow: 0 0 12px rgba(255,83,103,.55); pointer-events: none;
+}
+.playlist-track-row.playlist-drop-before::before { top: -5px; }
+.playlist-track-row.playlist-drop-after::after { bottom: -5px; }
+.playlist-reordering, .playlist-reordering * { cursor: grabbing !important; }
+.playlist-reordering { user-select: none; -webkit-user-select: none; }
+.playlist-track-menu { position: relative; flex: 0 0 auto; }
+.playlist-track-menu > summary { list-style: none; cursor: pointer; }
+.playlist-track-menu > summary::-webkit-details-marker { display: none; }
+.playlist-track-menu[open] > summary { color: #ff9aa5; background: rgba(224,31,44,.12); }
+.playlist-track-menu-popover {
+  position: absolute; z-index: 30; right: 0; top: calc(100% + 5px);
+  width: max-content; min-width: 190px; padding: 6px;
+  display: flex; flex-direction: column; gap: 3px;
+  border: 1px solid rgba(255,255,255,.1); border-radius: 12px;
+  background: #211a20; box-shadow: 0 12px 32px rgba(0,0,0,.42);
+}
+.playlist-track-menu-popover button {
+  min-height: 36px; padding: 0 10px; border: 0; border-radius: 8px;
+  background: transparent; color: #eee4e9; text-align: left;
+  font-size: 11px; cursor: pointer;
+}
+.playlist-track-menu-popover button:active:not(:disabled),
+.playlist-track-menu-popover button:hover:not(:disabled) { background: rgba(224,31,44,.14); color: #ffb0b5; }
+.playlist-track-menu-popover button:disabled { opacity: .35; cursor: default; }
+@media (max-width: 430px) {
+  .playlist-track-row { gap: 5px; padding: 8px 6px; }
+  .playlist-reorder-handle { width: 20px; min-width: 20px; }
+  .playlist-track-position { width: 16px; flex-basis: 16px; font-size: 9px; }
+}

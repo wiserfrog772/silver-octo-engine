@@ -397,8 +397,6 @@ body.player-overlay-open .bottom-nav { visibility: hidden; }
 
 
 /* Keep track actions recognizable at a glance: queue list vs. playlist document. */
-.track-actions .playlist-add-action svg { stroke-width: 1.7; }
-.track-actions .playlist-add-action { color: #d998a4; }
 .track-actions [data-action="enqueue"] { color: #ff8d9a; }
 
 /* Focus the home screen on the music collection, without the introductory media-library hero. */
@@ -414,7 +412,6 @@ body.player-overlay-open .bottom-nav { visibility: hidden; }
   -webkit-user-select: none;
 }
 #player:not(.player-fullscreen) .full-player-top,
-#player:not(.player-fullscreen) .timeline,
 #player:not(.player-fullscreen) .player-controls .control-button {
   display: none !important;
 }
@@ -485,3 +482,116 @@ body.player-overlay-open .bottom-nav { visibility: hidden; }
 
 .playlist-search-box { margin: 0 0 14px; }
 .playlist-search-box input { font-size: 12px; }
+
+/* Compact track actions: the playlist action lives in a single kebab menu. */
+.track-context-menu,
+.playlist-track-menu { position: relative; flex: 0 0 auto; }
+.track-context-menu > summary,
+.playlist-track-menu > summary { list-style: none; cursor: pointer; }
+.track-context-menu > summary::-webkit-details-marker,
+.playlist-track-menu > summary::-webkit-details-marker { display: none; }
+.track-context-menu[open],
+.playlist-track-menu[open] { z-index: 36; }
+.track-more-action { font-size: 22px; line-height: 1; font-weight: 800; letter-spacing: -2px; color: #c9a4aa; }
+.track-context-menu[open] > summary,
+.playlist-track-menu[open] > summary { color: #ff9aa5; background: rgba(224,31,44,.14); }
+.track-context-popover,
+.playlist-track-menu-popover {
+  position: absolute; z-index: 38; right: 0; top: calc(100% + 5px);
+  width: max-content; min-width: 184px; max-width: min(245px, calc(100vw - 36px));
+  padding: 6px; display: flex; flex-direction: column; gap: 3px;
+  border: 1px solid rgba(255,255,255,.1); border-radius: 12px;
+  background: #211a20; box-shadow: 0 12px 32px rgba(0,0,0,.48);
+}
+.track-context-popover button,
+.playlist-track-menu-popover button {
+  min-height: 38px; padding: 0 10px; border: 0; border-radius: 8px;
+  background: transparent; color: #eee4e9; text-align: left;
+  font-size: 11px; cursor: pointer;
+}
+.track-context-popover button:hover,
+.track-context-popover button:focus-visible,
+.playlist-track-menu-popover button:hover:not(:disabled),
+.playlist-track-menu-popover button:focus-visible:not(:disabled) {
+  background: rgba(224,31,44,.14); color: #ffb0b5;
+}
+
+/* Right-swipe affordance. Vertical scrolling remains native; reorder grip is excluded. */
+.track-row { position: relative; overflow: visible; }
+.track-row.track-swipe-active,
+.track-row.track-swipe-settling {
+  z-index: 2;
+  transform: translateX(var(--swipe-offset, 0px));
+}
+.track-row.track-swipe-active { transition: none !important; }
+.track-row.track-swipe-settling { transition: transform .22s cubic-bezier(.2,.8,.2,1); }
+.track-swipe-hint {
+  position: absolute; z-index: 0; left: -86px; top: 0; bottom: 0; width: 86px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  border-radius: 14px 0 0 14px; color: #ff9aa5;
+  background: linear-gradient(90deg, rgba(104,8,27,.98), rgba(142,15,38,.92));
+  opacity: .95; pointer-events: none;
+}
+.track-swipe-hint span { font-size: 23px; line-height: 1; font-weight: 500; }
+.track-swipe-hint small { max-width: 72px; font-size: 7px; line-height: 1.15; font-weight: 800; text-align: center; }
+.track-row.track-swipe-active { border-color: rgba(255,126,139,.48); box-shadow: 0 5px 20px rgba(0,0,0,.2); }
+.track-row.track-swipe-active .track-swipe-hint { opacity: 1; }
+#trackList .track-row,
+#playlistContent .track-row { touch-action: pan-y; }
+
+/* A readable, interactive timeline is also visible in the compact dock. */
+.timeline { user-select: none; -webkit-user-select: none; }
+.timeline input {
+  appearance: none; -webkit-appearance: none; display: block; flex: 1; min-width: 0;
+  height: 18px; margin: 0; padding: 0; border: 0; border-radius: 0;
+  background: transparent; cursor: pointer; touch-action: pan-y;
+  --seek-progress: 0%;
+}
+.timeline input:disabled { cursor: default; opacity: .35; }
+.timeline input::-webkit-slider-runnable-track {
+  height: 3px; border-radius: 99px;
+  background: linear-gradient(90deg, #ef4055 0%, #ff8e98 var(--seek-progress), rgba(255,255,255,.17) var(--seek-progress), rgba(255,255,255,.17) 100%);
+}
+.timeline input::-webkit-slider-thumb {
+  appearance: none; -webkit-appearance: none; width: 10px; height: 10px; margin-top: -3.5px;
+  border: 1px solid rgba(255,255,255,.75); border-radius: 50%; background: #ff8e98;
+  box-shadow: 0 0 0 3px rgba(239,64,85,.13), 0 0 8px rgba(239,64,85,.35);
+}
+.timeline input::-moz-range-track { height: 3px; border-radius: 99px; background: rgba(255,255,255,.17); }
+.timeline input::-moz-range-progress { height: 3px; border-radius: 99px; background: #ef4055; }
+.timeline input::-moz-range-thumb {
+  width: 10px; height: 10px; border: 1px solid rgba(255,255,255,.75);
+  border-radius: 50%; background: #ff8e98; box-shadow: 0 0 0 3px rgba(239,64,85,.13);
+}
+.timeline input:focus-visible { outline: none; }
+.timeline:focus-within input::-webkit-slider-thumb { box-shadow: 0 0 0 5px rgba(239,64,85,.2); }
+
+#player:not(.player-fullscreen) {
+  min-height: 99px;
+  padding: 7px 14px 5px !important;
+}
+#player:not(.player-fullscreen) .full-player-top,
+#player:not(.player-fullscreen) .player-controls .control-button { display: none !important; }
+#player:not(.player-fullscreen) .timeline {
+  display: flex !important; align-items: center; gap: 9px;
+  min-height: 19px; margin: 3px 4px 0; color: #a99da5; font-size: 9px;
+}
+#player:not(.player-fullscreen) .timeline input { height: 18px; }
+#player:not(.player-fullscreen) #elapsed,
+#player:not(.player-fullscreen) #duration { min-width: 31px; text-align: center; }
+#player:not(.player-fullscreen) .player-track-row { min-height: 56px; }
+#player.player-fullscreen .timeline { display: flex; width: 100%; }
+#player.player-fullscreen .timeline input { height: 22px; }
+
+@media (max-width: 390px) {
+  .track-row { gap: 7px; padding: 8px 7px; }
+  .track-meta { font-size: 9px; }
+  .track-actions { gap: 0; }
+  .track-action { width: 28px; }
+  .track-context-popover,
+  .playlist-track-menu-popover { min-width: 174px; }
+}
+
+.toast { display: flex; align-items: center; justify-content: center; gap: 12px; }
+.toast-action { flex: 0 0 auto; min-height: 28px; padding: 0 9px; border: 1px solid rgba(255,142,152,.32); border-radius: 8px; background: rgba(224,31,44,.16); color: #ffadb4; font-size: 10px; font-weight: 800; cursor: pointer; }
+.toast-action:active { transform: scale(.96); }

@@ -3,6 +3,8 @@ import { cleanTrackTitle, cleanArtistName } from './modules/music-metadata.mjs';
 import { uniqueExistingTrackIds, sortLibraryTracks, playbackIdsForView as resolvePlaybackIds, filterPlaylistCards, filterPlaylistTracks } from './modules/player.mjs';
 import { escapeHtml, formatTimeLabel, pluralTrackCount } from './modules/ui.mjs';
 import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies } from './modules/youtube.mjs';
+import { movePlaylistTrack, movePlaylistTrackToPosition } from './modules/playlist-order.mjs';
+import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from './modules/track-interactions.mjs';
 
 (() => {
   'use strict';
@@ -16,6 +18,8 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
   const STORAGE_KEYS = {
     queue: 'crimson.mobile.queue',
     playlists: 'crimson.mobile.playlists',
+    playbackPlaylist: 'crimson.mobile.playback-playlist',
+    quickAddPlaylist: 'crimson.mobile.quick-add-playlist',
     sort: 'crimson.mobile.sort'
   };
   const LEGACY_STORAGE_KEYS = {
@@ -50,15 +54,18 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     playbackOrder: [],
     playlists: [],
     currentPlaylistId: null,
+    playbackPlaylistId: null,
     playlistQuery: '',
     editingPlaylistId: null,
     pendingPlaylistTrackId: null,
     pendingImportPlaylistId: null,
+    quickAddPlaylistId: (() => { try { return localStorage.getItem('crimson.mobile.quick-add-playlist') || null; } catch (_) { return null; } })(),
     shuffle: false,
     repeat: false,
     isPlaying: false,
     toastTimer: null,
     seekDragging: false,
+    pendingSeekTime: null,
     downloadListenerAttached: false,
     libraryRefreshing: false,
     libraryRefreshRequested: false,
@@ -357,12 +364,27 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
   const formatTime = formatTimeLabel;
   const pluralTracks = pluralTrackCount;
 
-  function showToast(message) {
+  function showToast(message, actionLabel = '', actionHandler = null) {
     const toast = $('#toast');
-    toast.textContent = message;
+    toast.replaceChildren();
+    const text = document.createElement('span');
+    text.textContent = String(message || '');
+    toast.append(text);
+    if (actionLabel && typeof actionHandler === 'function') {
+      const action = document.createElement('button');
+      action.type = 'button';
+      action.className = 'toast-action';
+      action.textContent = String(actionLabel);
+      action.setAttribute('aria-label', String(actionLabel));
+      action.addEventListener('click', () => {
+        toast.classList.remove('visible');
+        actionHandler();
+      }, { once: true });
+      toast.append(action);
+    }
     toast.classList.add('visible');
     clearTimeout(state.toastTimer);
-    state.toastTimer = setTimeout(() => toast.classList.remove('visible'), 2600);
+    state.toastTimer = setTimeout(() => toast.classList.remove('visible'), 3600);
   }
 
   function trackById(id) {
@@ -385,12 +407,25 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     return uniqueExistingTrackIds(ids, (id) => !!trackById(id));
   }
 
+  function setPlaybackPlaylist(playlistId) {
+    state.playbackPlaylistId = playlistId && playlistById(playlistId) ? playlistId : null;
+    try { localStorage.setItem(STORAGE_KEYS.playbackPlaylist, state.playbackPlaylistId || ''); } catch (_) {}
+  }
+
   function savePlaylists() {
     try {
       localStorage.setItem(STORAGE_KEYS.playlists, JSON.stringify(state.playlists.map((playlist) => ({
         id: playlist.id, name: playlist.name, trackIds: playlist.trackIds, createdAt: playlist.createdAt || Date.now()
       }))));
     } catch (_) { showToast('Не удалось сохранить плейлисты на устройстве.'); }
+  }
+
+  function saveQuickAddPlaylist(playlistId) {
+    state.quickAddPlaylistId = playlistId && playlistById(playlistId) ? playlistId : null;
+    try {
+      if (state.quickAddPlaylistId) localStorage.setItem(STORAGE_KEYS.quickAddPlaylist, state.quickAddPlaylistId);
+      else localStorage.removeItem(STORAGE_KEYS.quickAddPlaylist);
+    } catch (_) {}
   }
 
   function libraryTracks() {
@@ -524,9 +559,10 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
         ? queueAction
         : '<button class="track-action" data-action="enqueue" data-id="' + esc(track.id) + '" aria-label="Добавить в очередь" title="В очередь"><svg viewBox="0 0 24 24"><path d="M4 6h12M4 12h12M4 18h7M19 14v7m-3.5-3.5h7"/></svg></button>';
       const playlistAction = track.isRemote ? '' :
-        '<button class="track-action playlist-add-action" data-action="add-to-playlist" data-id="' + esc(track.id) + '" aria-label="Добавить в плейлист" title="Добавить в плейлист"><svg viewBox="0 0 24 24"><path d="M4 3h10l4 4v6M14 3v5h4M7 11h7M7 15h5M18 16v6m-3.5-3h7"/></svg></button>';
+        '<details class="track-context-menu"><summary class="track-action track-more-action" aria-label="Другие действия с композицией" title="Действия">⋮</summary>' +
+          '<div class="track-context-popover" role="group" aria-label="Действия с композицией"><button type="button" data-action="add-to-playlist" data-id="' + esc(track.id) + '">Добавить в плейлист…</button></div></details>';
       return '<article class="track-row' + (playing ? ' playing' : '') + '" data-track="' + esc(track.id) + '">' +
-        coverMarkup(track) +
+        '<div class="track-swipe-hint" aria-hidden="true"><span>＋</span><small>Добавить<br>в плейлист</small></div>' + coverMarkup(track) +
         '<div class="track-main" data-action="play" data-id="' + esc(track.id) + '" role="button" tabindex="0" aria-label="Воспроизвести ' + esc(track.name) + '">' +
           '<div class="track-name">' + esc(track.name) + '</div><div class="track-artist">' + esc(track.artist || 'Неизвестный исполнитель') + '</div>' +
         '</div>' +
@@ -535,16 +571,107 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     }).join('');
   }
 
-  function renderPlaylistTrack(track) {
-    return '<article class="track-row" data-playlist-track="' + esc(track.id) + '">' +
+  function renderPlaylistTrack(track, position, total) {
+    const canMoveUp = position > 0;
+    const canMoveDown = position < total - 1;
+    return '<article class="track-row playlist-track-row" data-playlist-track="' + esc(track.id) + '" data-position="' + (position + 1) + '">' +
+      '<div class="track-swipe-hint" aria-hidden="true"><span>＋</span><small>Добавить<br>в плейлист</small></div>' +
+      '<button class="playlist-reorder-handle" data-reorder-handle="true" type="button" aria-label="Перетащить ' + esc(track.name) + '" title="Перетащить для изменения порядка">⠿</button>' +
+      '<span class="playlist-track-position" aria-label="Позиция ' + (position + 1) + '">' + (position + 1) + '</span>' +
       coverMarkup(track) +
       '<div class="track-main" data-action="play" data-id="' + esc(track.id) + '" role="button" tabindex="0" aria-label="Воспроизвести ' + esc(track.name) + '">' +
         '<div class="track-name">' + esc(track.name) + '</div><div class="track-artist">' + esc(track.artist || 'Неизвестный исполнитель') + '</div>' +
       '</div><div class="track-meta">' + (Number(track.duration) > 0 ? formatTime(track.duration) : '—:—') + '</div>' +
       '<div class="track-actions">' +
-        '<button class="track-action" data-action="enqueue" data-id="' + esc(track.id) + '" aria-label="Добавить в очередь" title="В очередь"><svg viewBox="0 0 24 24"><path d="M4 6h12M4 12h12M4 18h7M19 14v7m-3.5-3.5h7"/></svg></button>' +
-        '<button class="track-action" data-playlist-action="remove-track" data-id="' + esc(track.id) + '" aria-label="Убрать из плейлиста" title="Убрать из плейлиста"><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>' +
+        '<details class="playlist-track-menu"><summary class="track-action" aria-label="Действия с треком" title="Дополнительные действия">⋮</summary>' +
+          '<div class="playlist-track-menu-popover" role="group" aria-label="Действия с треком">' +
+            '<button type="button" data-playlist-action="add-to-playlist" data-id="' + esc(track.id) + '">Добавить в другой плейлист…</button>' +
+            '<button type="button" data-playlist-action="enqueue-track" data-id="' + esc(track.id) + '">Добавить в очередь</button>' +
+            '<button type="button" data-playlist-action="move-up" data-id="' + esc(track.id) + '"' + (canMoveUp ? '' : ' disabled') + '>Переместить выше</button>' +
+            '<button type="button" data-playlist-action="move-down" data-id="' + esc(track.id) + '"' + (canMoveDown ? '' : ' disabled') + '>Переместить ниже</button>' +
+            '<button type="button" data-playlist-action="set-position" data-id="' + esc(track.id) + '">Указать позицию…</button>' +
+            '<button type="button" data-playlist-action="remove-track" data-id="' + esc(track.id) + '">Убрать из плейлиста</button>' +
+          '</div>' +
+        '</details>' +
       '</div></article>';
+  }
+
+  function capturePlaylistRowPositions() {
+    const positions = new Map();
+    document.querySelectorAll('#playlistContent .track-row[data-playlist-track]').forEach((row) => {
+      positions.set(row.dataset.playlistTrack, row.getBoundingClientRect());
+    });
+    return positions;
+  }
+
+  function animatePlaylistRows(previousPositions) {
+    if (!previousPositions || !previousPositions.size ||
+        (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) return;
+    document.querySelectorAll('#playlistContent .track-row[data-playlist-track]').forEach((row) => {
+      const previous = previousPositions.get(row.dataset.playlistTrack);
+      if (!previous || typeof row.animate !== 'function') return;
+      const current = row.getBoundingClientRect();
+      const deltaY = previous.top - current.top;
+      if (Math.abs(deltaY) < 1) return;
+      row.animate([
+        { transform: 'translateY(' + deltaY + 'px)' },
+        { transform: 'translateY(0)' }
+      ], { duration: 190, easing: 'cubic-bezier(.2,.8,.2,1)' });
+    });
+  }
+
+  function refreshActivePlaylistPlayback(playlist) {
+    if (!playlist || state.playbackPlaylistId !== playlist.id) return;
+    state.playbackOrder = uniqueTrackIds(playlist.trackIds);
+    state.nativeQueueOrder = null;
+    state.nativeQueueLastKey = '';
+    if (isNativePlaybackNotificationAvailable() && currentTrack()) void syncNativePlayback(true);
+  }
+
+  function persistPlaylistOrder(playlist, nextIds, message) {
+    if (!playlist || !Array.isArray(nextIds) || nextIds.length !== playlist.trackIds.length ||
+        new Set(nextIds).size !== nextIds.length || nextIds.some((id) => !playlist.trackIds.includes(id))) return false;
+    if (nextIds.every((id, index) => id === playlist.trackIds[index])) return false;
+
+    const previousPositions = capturePlaylistRowPositions();
+    playlist.trackIds = nextIds.slice();
+    savePlaylists();
+
+    // Only the playlist that started the active playback owns its sequential order.
+    // A change in another playlist must never disturb the currently playing source.
+    // setQueue rebuilds the ExoPlayer timeline at the same current media ID and
+    // playback position; shuffle/repeat flags and manually queued items are retained.
+    refreshActivePlaylistPlayback(playlist);
+
+    renderPlaylists();
+    animatePlaylistRows(previousPositions);
+    if (message) showToast(message);
+    return true;
+  }
+
+  function movePlaylistTrackBy(playlist, trackId, offset) {
+    if (!playlist) return;
+    const ids = uniqueTrackIds(playlist.trackIds);
+    const index = ids.indexOf(trackId);
+    const targetIndex = index + offset;
+    if (index < 0 || targetIndex < 0 || targetIndex >= ids.length) return;
+    const next = movePlaylistTrack(ids, trackId, ids[targetIndex], offset < 0 ? 'before' : 'after');
+    persistPlaylistOrder(playlist, next, 'Порядок плейлиста сохранён.');
+  }
+
+  function movePlaylistTrackToUserPosition(playlist, trackId) {
+    if (!playlist) return;
+    const ids = uniqueTrackIds(playlist.trackIds);
+    const currentPosition = ids.indexOf(trackId) + 1;
+    const value = window.prompt('Новая позиция трека (1–' + ids.length + '):', String(currentPosition));
+    if (value === null) return;
+    const position = Number(String(value).trim());
+    const next = movePlaylistTrackToPosition(ids, trackId, position);
+    if (!next) {
+      showToast('Укажи целый номер позиции от 1 до ' + ids.length + '.');
+      return;
+    }
+    persistPlaylistOrder(playlist, next, 'Трек перемещён на позицию ' + position + '.');
   }
 
   function renderPlaylists() {
@@ -552,10 +679,11 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     if (!root) return;
     const playlist = playlistById(state.currentPlaylistId);
     if (playlist) {
-      const allTracks = uniqueTrackIds(playlist.trackIds).map(trackById).filter(Boolean);
+      const orderedIds = uniqueTrackIds(playlist.trackIds);
+      const allTracks = orderedIds.map(trackById).filter(Boolean);
       const tracks = filterPlaylistTracks(allTracks, state.playlistQuery);
       const content = tracks.length
-        ? '<div class="track-list playlist-track-list">' + tracks.map(renderPlaylistTrack).join('') + '</div>'
+        ? '<div class="track-list playlist-track-list" data-playlist-track-list="' + esc(playlist.id) + '">' + tracks.map((track) => renderPlaylistTrack(track, orderedIds.indexOf(track.id), orderedIds.length)).join('') + '</div>'
         : (allTracks.length
           ? '<div class="empty-state"><h3>Ничего не найдено</h3><p>Измени запрос поиска по трекам или исполнителям.</p></div>'
           : '<div class="empty-state playlist-drop-target" data-playlist-drop="' + esc(playlist.id) + '"><div class="empty-glyph">♫</div><h3>Плейлист пуст</h3><p>Добавь файлы музыки сюда или нажми кнопку добавления. Добавленные треки останутся и в общей медиатеке.</p><button class="primary-button" data-playlist-action="add-music" data-id="' + esc(playlist.id) + '" type="button">＋ Добавить музыку</button><button class="secondary-button" data-playlist-action="back" type="button">Моя музыка</button></div>');
@@ -595,7 +723,7 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     }).join('') + '</div>';
   }
 
-  function enqueueTracksFromCurrent(ids, label) {
+  function enqueueTracksFromCurrent(ids, label, playlistId = null) {
     const order = uniqueTrackIds(ids);
     if (!order.length) { showToast('В этом списке пока нет треков.'); return; }
     const currentIndex = order.indexOf(state.currentId);
@@ -605,6 +733,7 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     const additions = upcoming.filter((id) => !queued.has(id));
     state.queue.push(...additions);
     state.playbackOrder = order;
+    setPlaybackPlaylist(playlistId);
     saveQueue();
     render();
     showToast(additions.length
@@ -621,34 +750,49 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     $('#playlistNameInput').focus();
   }
 
-  function openAddToPlaylistDialog(trackId) {
+  function openAddToPlaylistDialog(trackId, excludePlaylistId = null) {
     const track = trackById(trackId);
     if (!track) return;
     state.pendingPlaylistTrackId = trackId;
     $('#addToPlaylistTrackName').textContent = '«' + track.name + '»';
-    $('#playlistTargetSelect').innerHTML = state.playlists.map((playlist) =>
-      '<option value="' + esc(playlist.id) + '">' + esc(playlist.name) + '</option>').join('');
-    if (!state.playlists.length) {
-      $('#playlistTargetSelect').disabled = true;
-      $('#addToPlaylistForm button[type="submit"]').disabled = true;
-    } else {
-      $('#playlistTargetSelect').disabled = false;
-      $('#addToPlaylistForm button[type="submit"]').disabled = false;
-    }
+    const choices = state.playlists.filter((playlist) => playlist.id !== excludePlaylistId);
+    const availableChoices = choices.filter((playlist) => !playlist.trackIds.includes(trackId));
+    $('#playlistTargetSelect').innerHTML = choices.length
+      ? choices.map((playlist) => '<option value="' + esc(playlist.id) + '"' + (playlist.trackIds.includes(trackId) ? ' disabled' : '') + '>' + esc(playlist.name) + (playlist.trackIds.includes(trackId) ? ' · уже добавлен' : '') + '</option>').join('')
+      : '<option value="" selected>Создай новый плейлист</option>';
+    const preferred = availableChoices.find((playlist) => playlist.id === state.quickAddPlaylistId) || availableChoices[0];
+    if (preferred) $('#playlistTargetSelect').value = preferred.id;
+    $('#playlistTargetSelect').disabled = !availableChoices.length;
+    $('#addToPlaylistForm button[type="submit"]').disabled = !availableChoices.length;
     $('#addToPlaylistDialog').showModal();
   }
 
-  function addTrackToPlaylist(playlistId, trackId) {
+  function addTrackToPlaylist(playlistId, trackId, options = {}) {
     const playlist = playlistById(playlistId);
-    if (!playlist || !trackById(trackId)) return;
+    if (!playlist || !trackById(trackId)) return false;
     if (playlist.trackIds.includes(trackId)) {
       showToast('Этот трек уже есть в плейлисте.');
-      return;
+      return false;
     }
     playlist.trackIds.push(trackId);
     savePlaylists();
+    saveQuickAddPlaylist(playlist.id);
+    refreshActivePlaylistPlayback(playlist);
     render();
-    showToast('Добавлено в плейлист «' + playlist.name + '».');
+    const message = 'Добавлено в плейлист «' + playlist.name + '».';
+    if (options.undoable) {
+      showToast(message, 'Отменить', () => {
+        const current = playlistById(playlistId);
+        const index = current ? current.trackIds.indexOf(trackId) : -1;
+        if (index < 0) return;
+        current.trackIds.splice(index, 1);
+        savePlaylists();
+        refreshActivePlaylistPlayback(current);
+        render();
+        showToast('Добавление отменено.');
+      });
+    } else showToast(message);
+    return true;
   }
 
   function setPlayerFullscreen(open) {
@@ -687,12 +831,14 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     $('#playPause').setAttribute('aria-label', state.isPlaying ? 'Пауза' : 'Воспроизвести');
     const native = isNativePlaybackNotificationAvailable();
     const audioDuration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
-    const knownDuration = native ? (state.nativeDuration || Number(track && track.duration) || 0) : (audioDuration || Number(track && track.duration) || 0);
-    const elapsed = currentPlaybackPosition();
+    const knownDuration = !track ? 0 : (native ? (state.nativeDuration || Number(track.duration) || 0) : (audioDuration || Number(track.duration) || 0));
+    const elapsed = track ? currentPlaybackPosition() : 0;
     $('#seek').disabled = !track || knownDuration <= 0;
     $('#duration').textContent = knownDuration > 0 ? formatTime(knownDuration) : (track ? '—:—' : '0:00');
-    $('#elapsed').textContent = formatTime(elapsed);
-    if (!state.seekDragging) $('#seek').value = knownDuration > 0 ? String(Math.round(Math.min(1, elapsed / knownDuration) * 1000)) : '0';
+    const displayedElapsed = knownDuration > 0 ? Math.min(knownDuration, elapsed) : elapsed;
+    $('#elapsed').textContent = formatTime(displayedElapsed);
+    updateSeekVisual(displayedElapsed, knownDuration);
+    if (!state.seekDragging) $('#seek').value = knownDuration > 0 ? String(Math.round(Math.min(1, displayedElapsed / knownDuration) * 1000)) : '0';
     $('#shuffle').classList.toggle('selected', state.shuffle);
     $('#repeat').classList.toggle('selected', state.repeat);
     $('#repeatDot').classList.toggle('hidden', !state.repeat);
@@ -792,6 +938,13 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
         })) : [];
       } catch (_) { state.playlists = []; }
       savePlaylists();
+      if (state.quickAddPlaylistId && !playlistById(state.quickAddPlaylistId)) saveQuickAddPlaylist(null);
+      try {
+        const savedPlaybackPlaylist = localStorage.getItem(STORAGE_KEYS.playbackPlaylist);
+        state.playbackPlaylistId = savedPlaybackPlaylist && playlistById(savedPlaybackPlaylist)
+          ? savedPlaybackPlaylist : null;
+        if (!state.playbackPlaylistId && savedPlaybackPlaylist) localStorage.removeItem(STORAGE_KEYS.playbackPlaylist);
+      } catch (_) { state.playbackPlaylistId = null; }
       state.playbackOrder = libraryOrderIds();
       render();
       if (state.pendingNativeSnapshot) {
@@ -1121,6 +1274,7 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
           }
         }
         savePlaylists();
+        refreshActivePlaylistPlayback(targetPlaylist);
       }
       scheduleMissingDurations(attached);
       added = records.length;
@@ -1177,6 +1331,8 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     state.queue = state.queue.filter((item) => item !== id);
     state.playbackOrder = state.playbackOrder.filter((item) => item !== id);
     state.playlists.forEach((playlist) => { playlist.trackIds = playlist.trackIds.filter((item) => item !== id); });
+    const activePlaybackPlaylist = playlistById(state.playbackPlaylistId);
+    if (activePlaybackPlaylist) refreshActivePlaylistPlayback(activePlaybackPlaylist);
     saveQueue();
     savePlaylists();
     try {
@@ -1197,9 +1353,10 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     }
   }
 
-  async function playTrack(id, orderIds) {
+  async function playTrack(id, orderIds, playlistId) {
     const track = trackById(id);
     if (!track) return;
+    if (arguments.length >= 3) setPlaybackPlaylist(playlistId);
     if (Array.isArray(orderIds)) {
       state.playbackOrder = uniqueTrackIds(orderIds);
       if (!state.playbackOrder.includes(id)) state.playbackOrder.unshift(id);
@@ -1227,6 +1384,8 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     }
     state.currentId = id;
     state.currentRemoteTrack = null;
+    state.seekDragging = false;
+    state.pendingSeekTime = null;
     state.nativeQueueOrder = null;
     state.nativeQueueLastKey = '';
     if (native) {
@@ -1276,11 +1435,11 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
         const firstId = state.queue.shift();
         const order = uniqueTrackIds([firstId, ...state.queue, ...state.playbackOrder]);
         saveQueue();
-        await playTrack(firstId, order);
+        await playTrack(firstId, order, null);
       } else {
         const available = playbackIdsForView();
         const firstId = available[0] || (state.tracks[0] && state.tracks[0].id);
-        if (firstId) await playTrack(firstId, available.length ? available : libraryOrderIds());
+        if (firstId) await playTrack(firstId, available.length ? available : libraryOrderIds(), null);
         else {
           filePicker.click();
           showToast('Сначала добавь музыку в медиатеку.');
@@ -1481,6 +1640,14 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     return Math.max(0, Number(audio.currentTime) || 0);
   }
 
+  function updateSeekVisual(position, duration) {
+    const percent = seekProgressPercent(position, duration);
+    const seek = $('#seek');
+    seek.style.setProperty('--seek-progress', percent.toFixed(2) + '%');
+    const current = Number(position) > 0 ? Number(position) : 0;
+    seek.setAttribute('aria-valuetext', formatTime(current) + ' из ' + (Number(duration) > 0 ? formatTime(duration) : 'неизвестной длительности'));
+  }
+
   function startNativeProgressTimer() {
     if (state.nativeProgressTimer || !isNativePlaybackNotificationAvailable() || document.hidden || !state.isPlaying) return;
     state.nativeProgressTimer = setInterval(() => {
@@ -1490,9 +1657,11 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
       }
       const duration = state.nativeDuration || Number(currentTrack() && currentTrack().duration) || 0;
       const position = currentPlaybackPosition();
-      $('#elapsed').textContent = formatTime(position);
-      if (duration > 0) $('#seek').value = String(Math.round(Math.min(1, position / duration) * 1000));
-    }, 1000);
+      const displayed = duration > 0 ? Math.min(duration, position) : position;
+      $('#elapsed').textContent = formatTime(displayed);
+      updateSeekVisual(displayed, duration);
+      if (duration > 0 && !state.seekDragging) $('#seek').value = String(Math.round(Math.min(1, displayed / duration) * 1000));
+    }, 250);
   }
 
   function stopNativeProgressTimer() {
@@ -1732,9 +1901,12 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
       render();
       updatePlayingRows();
     } else {
-      $('#elapsed').textContent = formatTime(currentPlaybackPosition());
+      const position = currentPlaybackPosition();
+      const displayed = state.nativeDuration > 0 ? Math.min(state.nativeDuration, position) : position;
+      $('#elapsed').textContent = formatTime(displayed);
+      updateSeekVisual(displayed, state.nativeDuration);
       if (!state.seekDragging && state.nativeDuration > 0) {
-        $('#seek').value = String(Math.round(Math.min(1, currentPlaybackPosition() / state.nativeDuration) * 1000));
+        $('#seek').value = String(Math.round(Math.min(1, displayed / state.nativeDuration) * 1000));
       }
     }
     state.applyingNativeSnapshot = false;
@@ -1866,34 +2038,107 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
 
   let suppressTrackClickUntil = 0;
   let suppressTrackClickId = '';
+  let trackSwipeGesture = null;
+
+  function resetTrackSwipeRow(row) {
+    if (!row || (!row.classList.contains('track-swipe-active') && !row.style.getPropertyValue('--swipe-offset'))) return;
+    row.classList.remove('track-swipe-active');
+    row.classList.add('track-swipe-settling');
+    row.style.setProperty('--swipe-offset', '0px');
+    setTimeout(() => {
+      row.classList.remove('track-swipe-settling');
+      row.style.removeProperty('--swipe-offset');
+    }, 230);
+  }
+
+  function completeTrackSwipe(gesture) {
+    const sourcePlaylistId = gesture.sourcePlaylistId;
+    const target = resolveSwipePlaylist(state.playlists, state.quickAddPlaylistId, sourcePlaylistId);
+    if (target && !target.trackIds.includes(gesture.trackId)) {
+      addTrackToPlaylist(target.id, gesture.trackId, { undoable: true });
+      return;
+    }
+    if (target && target.trackIds.includes(gesture.trackId)) {
+      const anotherAvailable = state.playlists.some((playlist) => playlist.id !== sourcePlaylistId && !playlist.trackIds.includes(gesture.trackId));
+      if (!anotherAvailable) {
+        showToast('Этот трек уже есть в выбранном плейлисте.');
+        return;
+      }
+    }
+    openAddToPlaylistDialog(gesture.trackId, sourcePlaylistId);
+  }
+
   function enableTrackPlaylistSwipe(container) {
-    let start = null;
     container.addEventListener('pointerdown', (event) => {
       if (!event.isPrimary || (event.pointerType === 'mouse' && event.button !== 0)) return;
+      if (event.target.closest('button, summary, details, input, select, textarea, a, [data-reorder-handle]')) return;
       const row = event.target.closest('.track-row[data-track], .track-row[data-playlist-track]');
-      if (!row || event.target.closest('input, select, textarea, a')) return;
-      start = {
-        x: event.clientX,
-        y: event.clientY,
-        id: row.dataset.track || row.dataset.playlistTrack || ''
+      if (!row) return;
+      const trackId = row.dataset.track || row.dataset.playlistTrack || '';
+      if (!trackId) return;
+      trackSwipeGesture = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        trackId,
+        sourcePlaylistId: row.dataset.playlistTrack ? state.currentPlaylistId : null,
+        row,
+        active: false
       };
     });
-    container.addEventListener('pointerup', (event) => {
-      if (!start) return;
-      const gesture = start;
-      start = null;
-      const dx = event.clientX - gesture.x;
-      const dy = event.clientY - gesture.y;
-      if (!gesture.id || Math.abs(dx) < 48 || Math.abs(dx) < Math.abs(dy) * 1.25) return;
-      event.preventDefault();
-      suppressTrackClickId = gesture.id;
-      suppressTrackClickUntil = Date.now() + 650;
-      openAddToPlaylistDialog(gesture.id);
-    });
-    container.addEventListener('pointercancel', () => { start = null; });
   }
+
   enableTrackPlaylistSwipe($('#trackList'));
   enableTrackPlaylistSwipe($('#playlistContent'));
+
+  document.addEventListener('pointermove', (event) => {
+    const gesture = trackSwipeGesture;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const dx = event.clientX - gesture.startX;
+    const dy = event.clientY - gesture.startY;
+    const direction = classifyTrackSwipe(dx, dy);
+    if (direction === 'vertical' || direction === 'left') {
+      trackSwipeGesture = null;
+      resetTrackSwipeRow(gesture.row);
+      return;
+    }
+    if (direction === 'right' || direction === 'commit') {
+      gesture.active = true;
+      event.preventDefault();
+      gesture.row.classList.add('track-swipe-active');
+      gesture.row.style.setProperty('--swipe-offset', Math.min(92, Math.max(0, dx)) + 'px');
+    }
+  }, { passive: false });
+
+  document.addEventListener('pointerup', (event) => {
+    const gesture = trackSwipeGesture;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    trackSwipeGesture = null;
+    const dx = event.clientX - gesture.startX;
+    const dy = event.clientY - gesture.startY;
+    const committed = classifyTrackSwipe(dx, dy) === 'commit';
+    if (committed) {
+      event.preventDefault();
+      suppressTrackClickId = gesture.trackId;
+      suppressTrackClickUntil = Date.now() + 650;
+      gesture.row.classList.add('track-swipe-settling');
+      gesture.row.style.setProperty('--swipe-offset', '0px');
+      setTimeout(() => {
+        gesture.row.classList.remove('track-swipe-active', 'track-swipe-settling');
+        gesture.row.style.removeProperty('--swipe-offset');
+      }, 230);
+      completeTrackSwipe(gesture);
+    } else {
+      resetTrackSwipeRow(gesture.row);
+    }
+  });
+
+  document.addEventListener('pointercancel', (event) => {
+    const gesture = trackSwipeGesture;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    trackSwipeGesture = null;
+    resetTrackSwipeRow(gesture.row);
+  });
 
   function suppressSwipeClick(event) {
     if (Date.now() > suppressTrackClickUntil || !suppressTrackClickId) return false;
@@ -1905,6 +2150,14 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     suppressTrackClickId = '';
     return true;
   }
+
+  // Keep only one kebab menu open and close it when the user taps elsewhere.
+  document.addEventListener('click', (event) => {
+    const activeMenu = event.target.closest('.track-context-menu, .playlist-track-menu');
+    document.querySelectorAll('.track-context-menu[open], .playlist-track-menu[open]').forEach((menu) => {
+      if (menu !== activeMenu) menu.open = false;
+    });
+  }, true);
 
   $('#trackList').addEventListener('click', (event) => {
     if (suppressSwipeClick(event)) return;
@@ -1924,6 +2177,8 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     const action = event.target.closest('[data-action]');
     if (!action) return;
     const id = action.dataset.id;
+    const contextMenu = action.closest('.track-context-menu');
+    if (contextMenu) contextMenu.open = false;
     switch (action.dataset.action) {
       case 'play':
         if (state.view === 'queue' && currentTrack() && currentTrack().id === id) {
@@ -1937,9 +2192,9 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
             const playback = uniqueTrackIds([id, ...remaining, ...state.playbackOrder]);
             state.queue = remaining;
             saveQueue();
-            playTrack(id, playback);
-          } else playTrack(id, playbackIdsForView());
-        } else playTrack(id, playbackIdsForView());
+            playTrack(id, playback, null);
+          } else playTrack(id, playbackIdsForView(), null);
+        } else playTrack(id, playbackIdsForView(), null);
         break;
       case 'enqueue': enqueue(id); break;
       case 'add-to-playlist': openAddToPlaylistDialog(id); break;
@@ -1960,7 +2215,7 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('[data-action="play"]')) {
       event.preventDefault();
       const playlist = playlistById(state.currentPlaylistId);
-      playTrack(event.target.dataset.id, playlist ? playlist.trackIds : libraryOrderIds());
+      playTrack(event.target.dataset.id, playlist ? playlist.trackIds : libraryOrderIds(), playlist ? playlist.id : null);
     }
   });
 
@@ -2031,7 +2286,7 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
   });
 
   $('#queueFromCurrent').addEventListener('click', () => enqueueTracksFromCurrent(
-    libraryOrderIds(), 'медиатека'));
+    libraryOrderIds(), 'медиатека', null));
 
   $('#createPlaylist').addEventListener('click', () => openPlaylistNameDialog(null));
   $('#cancelPlaylistName').addEventListener('click', () => {
@@ -2053,6 +2308,7 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
       state.currentPlaylistId = playlist.id;
       if (state.pendingPlaylistTrackId) {
         playlist.trackIds.push(state.pendingPlaylistTrackId);
+        saveQuickAddPlaylist(playlist.id);
         state.pendingPlaylistTrackId = null;
         $('#addToPlaylistDialog').close();
       }
@@ -2065,7 +2321,8 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     state.editingPlaylistId = null;
   });
 
-  $('#cancelAddToPlaylist').addEventListener('click', () => $('#addToPlaylistDialog').close());
+  $('#cancelAddToPlaylist').addEventListener('click', () => { state.pendingPlaylistTrackId = null; $('#addToPlaylistDialog').close(); });
+  $('#addToPlaylistDialog').addEventListener('cancel', () => { state.pendingPlaylistTrackId = null; });
   $('#createFromAddPlaylist').addEventListener('click', () => {
     $('#addToPlaylistDialog').close();
     openPlaylistNameDialog(null);
@@ -2077,10 +2334,125 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     event.preventDefault();
     const playlistId = $('#playlistTargetSelect').value;
     const trackId = state.pendingPlaylistTrackId;
-    if (playlistId && trackId) addTrackToPlaylist(playlistId, trackId);
+    if (playlistId && trackId) {
+      saveQuickAddPlaylist(playlistId);
+      addTrackToPlaylist(playlistId, trackId);
+    }
     state.pendingPlaylistTrackId = null;
     $('#addToPlaylistDialog').close();
   });
+
+  // Pointer-based sorting works with a mouse, stylus and Android touch input.
+  // The dedicated grip keeps ordinary vertical scrolling and track taps unaffected.
+  let playlistPointerDrag = null;
+
+  function clearPlaylistDropTargets() {
+    document.querySelectorAll('#playlistContent .playlist-drop-before, #playlistContent .playlist-drop-after')
+      .forEach((row) => row.classList.remove('playlist-drop-before', 'playlist-drop-after'));
+  }
+
+  function clearPlaylistDropIndicators() {
+    clearPlaylistDropTargets();
+    document.querySelectorAll('#playlistContent .playlist-reorder-source')
+      .forEach((row) => row.classList.remove('playlist-reorder-source'));
+  }
+
+  function updatePlaylistPointerTarget(clientX, clientY) {
+    if (!playlistPointerDrag) return;
+    clearPlaylistDropTargets();
+    const list = $('#playlistContent [data-playlist-track-list]');
+    if (!list) { playlistPointerDrag.targetId = ''; return; }
+    const element = document.elementFromPoint(clientX, clientY);
+    const target = element && element.closest('.track-row[data-playlist-track]');
+    const sourceId = playlistPointerDrag.trackId;
+    if (target && target.dataset.playlistTrack !== sourceId && list.contains(target)) {
+      const rect = target.getBoundingClientRect();
+      const placement = clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+      target.classList.add(placement === 'before' ? 'playlist-drop-before' : 'playlist-drop-after');
+      playlistPointerDrag.targetId = target.dataset.playlistTrack;
+      playlistPointerDrag.placement = placement;
+      return;
+    }
+    const rows = Array.from(list.querySelectorAll('.track-row[data-playlist-track]'));
+    const sourceRow = rows.find((row) => row.dataset.playlistTrack === sourceId);
+    if (!rows.length || !sourceRow) { playlistPointerDrag.targetId = ''; return; }
+    const first = rows[0];
+    const last = rows[rows.length - 1];
+    if (clientY < first.getBoundingClientRect().top) {
+      if (first.dataset.playlistTrack !== sourceId) {
+        first.classList.add('playlist-drop-before');
+        playlistPointerDrag.targetId = first.dataset.playlistTrack;
+        playlistPointerDrag.placement = 'before';
+      } else playlistPointerDrag.targetId = '';
+    } else if (clientY > last.getBoundingClientRect().bottom) {
+      if (last.dataset.playlistTrack !== sourceId) {
+        last.classList.add('playlist-drop-after');
+        playlistPointerDrag.targetId = last.dataset.playlistTrack;
+        playlistPointerDrag.placement = 'after';
+      } else playlistPointerDrag.targetId = '';
+    } else {
+      playlistPointerDrag.targetId = '';
+    }
+  }
+
+  $('#playlistContent').addEventListener('pointerdown', (event) => {
+    const handle = event.target.closest('[data-reorder-handle]');
+    const row = handle && handle.closest('.track-row[data-playlist-track]');
+    const playlist = playlistById(state.currentPlaylistId);
+    if (!handle || !row || !playlist || !event.isPrimary ||
+        (event.pointerType === 'mouse' && event.button !== 0)) return;
+    playlistPointerDrag = {
+      pointerId: event.pointerId,
+      playlistId: playlist.id,
+      trackId: row.dataset.playlistTrack,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+      targetId: '',
+      placement: 'before',
+      sourceRow: row,
+      handle
+    };
+    try { handle.setPointerCapture(event.pointerId); } catch (_) {}
+  });
+
+  document.addEventListener('pointermove', (event) => {
+    const drag = playlistPointerDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+    if (!drag.active && distance < 7) return;
+    if (!drag.active) {
+      drag.active = true;
+      drag.sourceRow.classList.add('playlist-reorder-source');
+      document.body.classList.add('playlist-reordering');
+    }
+    event.preventDefault();
+    const edge = 64;
+    if (event.clientY < edge) window.scrollBy(0, -14);
+    else if (event.clientY > window.innerHeight - edge) window.scrollBy(0, 14);
+    updatePlaylistPointerTarget(event.clientX, event.clientY);
+  }, { passive: false });
+
+  function finishPlaylistPointerDrag(event, cancelled = false) {
+    const drag = playlistPointerDrag;
+    if (!drag || (event && drag.pointerId !== event.pointerId)) return;
+    playlistPointerDrag = null;
+    clearPlaylistDropIndicators();
+    document.body.classList.remove('playlist-reordering');
+    if (!drag.active) return;
+    if (!cancelled && drag.targetId) {
+      const playlist = playlistById(drag.playlistId);
+      const next = playlist && movePlaylistTrack(
+        uniqueTrackIds(playlist.trackIds), drag.trackId, drag.targetId, drag.placement
+      );
+      if (next) persistPlaylistOrder(playlist, next, 'Порядок плейлиста сохранён.');
+    }
+    suppressTrackClickUntil = Date.now() + 450;
+    suppressTrackClickId = drag.trackId;
+  }
+
+  document.addEventListener('pointerup', (event) => finishPlaylistPointerDrag(event, false));
+  document.addEventListener('pointercancel', (event) => finishPlaylistPointerDrag(event, true));
 
   $('#playlistContent').addEventListener('dragover', (event) => {
     if (event.dataTransfer && Array.from(event.dataTransfer.types || []).includes('Files')) {
@@ -2113,13 +2485,14 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
       const id = trackAction.dataset.id;
       if (trackAction.dataset.action === 'play') {
         const playlist = playlistById(state.currentPlaylistId);
-        playTrack(id, playlist ? playlist.trackIds : libraryOrderIds());
+        playTrack(id, playlist ? playlist.trackIds : libraryOrderIds(), playlist ? playlist.id : null);
       } else if (trackAction.dataset.action === 'enqueue') enqueue(id);
       return;
     }
     const id = action.dataset.id;
     const actionType = action.dataset.playlistAction;
-    const playlist = actionType === 'remove-track'
+    const isTrackOrderAction = ['remove-track', 'move-up', 'move-down', 'set-position', 'enqueue-track'].includes(actionType);
+    const playlist = isTrackOrderAction
       ? playlistById(state.currentPlaylistId)
       : (id ? playlistById(id) : playlistById(state.currentPlaylistId));
     switch (actionType) {
@@ -2133,16 +2506,35 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
       case 'delete':
         if (playlist && window.confirm('Удалить плейлист «' + playlist.name + '»? Сами аудиофайлы останутся в медиатеке.')) {
           state.playlists = state.playlists.filter((item) => item.id !== playlist.id);
+          if (state.quickAddPlaylistId === playlist.id) saveQuickAddPlaylist(null);
+          if (state.playbackPlaylistId === playlist.id) setPlaybackPlaylist(null);
           state.currentPlaylistId = null;
           savePlaylists();
           render();
           showToast('Плейлист удалён.');
         }
         break;
+      case 'add-to-playlist':
+        action.closest('details') && (action.closest('details').open = false);
+        openAddToPlaylistDialog(action.dataset.id, state.currentPlaylistId);
+        break;
+      case 'enqueue-track':
+        enqueue(action.dataset.id);
+        break;
+      case 'move-up':
+        movePlaylistTrackBy(playlist, action.dataset.id, -1);
+        break;
+      case 'move-down':
+        movePlaylistTrackBy(playlist, action.dataset.id, 1);
+        break;
+      case 'set-position':
+        movePlaylistTrackToUserPosition(playlist, action.dataset.id);
+        break;
       case 'remove-track':
         if (playlist) {
           playlist.trackIds = playlist.trackIds.filter((trackId) => trackId !== action.dataset.id);
           savePlaylists();
+          refreshActivePlaylistPlayback(playlist);
           renderPlaylists();
           showToast('Трек убран из плейлиста.');
         }
@@ -2152,6 +2544,7 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
           const ids = uniqueTrackIds(playlist.trackIds);
           if (!ids.length) { showToast('Сначала добавь треки в плейлист.'); break; }
           state.currentPlaylistId = playlist.id;
+          setPlaybackPlaylist(playlist.id);
           const startId = ids.includes(state.currentId) ? state.currentId : ids[0];
           const currentlyPlaying = isNativePlaybackNotificationAvailable() ? state.isPlaying : !audio.paused;
           if (state.currentId === startId && currentlyPlaying) {
@@ -2160,11 +2553,11 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
             state.nativeQueueLastKey = '';
             void syncNativePlayback(true);
             showToast('Порядок плейлиста активен.');
-          } else void playTrack(startId, ids);
+          } else void playTrack(startId, ids, playlist.id);
         }
         break;
       case 'enqueue-from-current':
-        if (playlist) enqueueTracksFromCurrent(playlist.trackIds, playlist.name);
+        if (playlist) enqueueTracksFromCurrent(playlist.trackIds, playlist.name, playlist.id);
         break;
     }
   });
@@ -2192,31 +2585,42 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
 
   $('#seek').addEventListener('pointerdown', () => { state.seekDragging = true; });
   $('#seek').addEventListener('pointerup', () => { state.seekDragging = false; });
+  $('#seek').addEventListener('pointercancel', () => { state.seekDragging = false; renderPlayer(); });
   $('#seek').addEventListener('input', (event) => {
     state.seekDragging = true;
     const track = currentTrack();
+    const audioDuration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
     const duration = isNativePlaybackNotificationAvailable()
       ? (state.nativeDuration || Number(track && track.duration) || 0)
-      : (Number.isFinite(audio.duration) ? audio.duration : 0);
+      : (audioDuration || Number(track && track.duration) || 0);
     if (duration > 0) {
       const target = (Number(event.currentTarget.value) / 1000) * duration;
       $('#elapsed').textContent = formatTime(target);
+      updateSeekVisual(target, duration);
     }
   });
   $('#seek').addEventListener('change', async (event) => {
     const track = currentTrack();
+    const audioDuration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
     const duration = isNativePlaybackNotificationAvailable()
       ? (state.nativeDuration || Number(track && track.duration) || 0)
-      : (Number.isFinite(audio.duration) ? audio.duration : 0);
+      : (audioDuration || Number(track && track.duration) || 0);
     if (duration > 0) {
       const target = (Number(event.currentTarget.value) / 1000) * duration;
       if (isNativePlaybackNotificationAvailable()) {
         state.nativePosition = target;
         state.nativePositionUpdatedAt = Date.now();
-        try { await window.CrimsonPlayback.seekTo({ positionMs: Math.round(target * 1000) }); } catch (_) {}
+        try { await window.CrimsonPlayback.seekTo({ positionMs: Math.round(target * 1000) }); }
+        catch (_) { showToast('Не удалось перемотать трек.'); }
       } else {
-        audio.currentTime = target;
+        try {
+          audio.currentTime = target;
+          state.pendingSeekTime = null;
+        } catch (_) {
+          state.pendingSeekTime = target;
+        }
       }
+      updateSeekVisual(target, duration);
     }
     state.seekDragging = false;
     renderPlayer();
@@ -2249,14 +2653,18 @@ import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies 
     if (isNativePlaybackNotificationAvailable()) return;
     if (state.seekDragging) return;
     const currentTime = audio.currentTime || 0;
-    $('#elapsed').textContent = formatTime(currentTime);
-    const duration = audio.duration;
-    if (Number.isFinite(duration) && duration > 0) {
-      $('#seek').value = String(Math.round((currentTime / duration) * 1000));
-    }
+    const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : Number(currentTrack() && currentTrack().duration) || 0;
+    const displayed = duration > 0 ? Math.min(duration, currentTime) : currentTime;
+    $('#elapsed').textContent = formatTime(displayed);
+    updateSeekVisual(displayed, duration);
+    if (duration > 0) $('#seek').value = String(Math.round((displayed / duration) * 1000));
   });
   audio.addEventListener('loadedmetadata', async () => {
     if (isNativePlaybackNotificationAvailable()) return;
+    if (state.pendingSeekTime !== null && Number.isFinite(audio.duration) && audio.duration > 0) {
+      try { audio.currentTime = Math.min(audio.duration, Math.max(0, state.pendingSeekTime)); } catch (_) {}
+      state.pendingSeekTime = null;
+    }
     const track = currentTrack();
     if (track && !track.isRemote && state.currentId && Number.isFinite(audio.duration) && audio.duration > 0) {
       track.duration = audio.duration;
