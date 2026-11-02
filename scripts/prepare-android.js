@@ -62,10 +62,10 @@ function patchManifest() {
       text = text.replace('</manifest>', '    <uses-permission android:name="' + permission + '" />\n</manifest>');
     }
   }
-  text = text.replace(/android:icon="[^"]*"/, 'android:icon="@drawable/localify_icon"');
-  text = text.replace(/android:roundIcon="[^"]*"/, 'android:roundIcon="@drawable/localify_icon"');
-  if (!/android:icon=/.test(text)) text = text.replace(/<application\b/, '<application android:icon="@drawable/localify_icon"');
-  if (!/android:roundIcon=/.test(text)) text = text.replace(/<application\b/, '<application android:roundIcon="@drawable/localify_icon"');
+  text = text.replace(/android:icon="[^"]*"/, 'android:icon="@drawable/crimson_icon"');
+  text = text.replace(/android:roundIcon="[^"]*"/, 'android:roundIcon="@drawable/crimson_icon"');
+  if (!/android:icon=/.test(text)) text = text.replace(/<application\b/, '<application android:icon="@drawable/crimson_icon"');
+  if (!/android:roundIcon=/.test(text)) text = text.replace(/<application\b/, '<application android:roundIcon="@drawable/crimson_icon"');
   if (!text.includes('com.localify.crimson.PlaybackActionReceiver')) {
     text = text.replace('</application>', '        <receiver android:name="com.localify.crimson.PlaybackActionReceiver" android:enabled="true" android:exported="false" />\n    </application>');
   }
@@ -97,9 +97,9 @@ function copyNativeFiles() {
     requireFile(src, 'Не найден исходник native plugin');
     fs.copyFileSync(src, path.join(javaTargetRoot, name));
   }
-  const icon = path.join(drawableSourceRoot, 'localify_icon.png');
-  requireFile(icon, 'Не найдена иконка Localify Crimson');
-  fs.copyFileSync(icon, path.join(drawableTargetRoot, 'localify_icon.png'));
+  const icon = path.join(drawableSourceRoot, 'crimson_icon.png');
+  requireFile(icon, 'Не найдена иконка Crimson');
+  fs.copyFileSync(icon, path.join(drawableTargetRoot, 'crimson_icon.png'));
 }
 function bundleBridge() {
   const entry = path.join(root, 'src', 'native-bridge.js');
@@ -115,4 +115,4 @@ bundleBridge();
 copyNativeFiles();
 patchGradle();
 patchManifest();
-console.log('Android project prepared: native LocalifyYtDlp plugin registered for in-app audio downloads');
+console.log('Android project prepared: native CrimsonYtDlp plugin registered for in-app audio downloads');

@@ -43,7 +43,7 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-@CapacitorPlugin(name = "LocalifyYtDlp")
+@CapacitorPlugin(name = "CrimsonYtDlp")
 public class YtDlpPlugin extends Plugin {
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private volatile boolean initialized = false;
@@ -389,7 +389,7 @@ public class YtDlpPlugin extends Plugin {
                     .addOption("--flat-playlist")
                     .addOption("--ignore-errors")
                     .addOption("--playlist-end", "6");
-                String processId = "localify-search-" + System.nanoTime();
+                String processId = "crimson-search-" + System.nanoTime();
                 YoutubeDLResponse response = YoutubeDL.getInstance().execute(request, processId, null);
                 JSArray entries = new JSArray();
                 String output = response.getOut();
@@ -478,7 +478,7 @@ public class YtDlpPlugin extends Plugin {
     public void streamInfo(PluginCall call) {
         String url = safe(call.getString("url"));
         if (!validUrl(url)) {
-            call.reject("Ссылка должна начинаться с http:// или https://.");
+            call.reject("Ссылка должна начинаться с https://.");
             return;
         }
         executor.execute(() -> {
@@ -583,7 +583,7 @@ public class YtDlpPlugin extends Plugin {
                                     .addOption("--embed-metadata");
                             }
 
-                            String processId = "localify-download-" + id + "-" + label.toLowerCase(Locale.ROOT)
+                            String processId = "crimson-download-" + id + "-" + label.toLowerCase(Locale.ROOT)
                                 + "-" + System.nanoTime();
                             Function3<Float, Long, String, Unit> callback = new Function3<Float, Long, String, Unit>() {
                                 @Override
@@ -712,9 +712,9 @@ public class YtDlpPlugin extends Plugin {
     private File musicOutputDirectory() {
         File root = getContext().getExternalFilesDir(Environment.DIRECTORY_MUSIC);
         if (root == null) root = new File(getContext().getFilesDir(), "Music");
-        File output = new File(root, "Localify Downloads");
+        File output = new File(root, "Crimson Downloads");
         if (!output.exists() && !output.mkdirs()) {
-            throw new IllegalStateException("Не удалось создать каталог загрузок Localify.");
+            throw new IllegalStateException("Не удалось создать каталог загрузок Crimson.");
         }
         return output;
     }
@@ -801,12 +801,12 @@ public class YtDlpPlugin extends Plugin {
     private void saveToPublicMusic(File source, String displayName) throws Exception {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             // Scoped Storage/MediaStore is not available on older Android versions.
-            // Keep a stable fallback in the app's Music/Localify Downloads directory.
+            // Keep a stable fallback in the app's Music/Crimson Downloads directory.
             File root = getContext().getExternalFilesDir(Environment.DIRECTORY_MUSIC);
             if (root == null) root = new File(getContext().getFilesDir(), "Music");
-            File directory = new File(root, "Localify Downloads");
+            File directory = new File(root, "Crimson Downloads");
             if (!directory.exists() && !directory.mkdirs()) {
-                throw new IllegalStateException("Не удалось создать каталог Music/Localify Downloads.");
+                throw new IllegalStateException("Не удалось создать каталог Music/Crimson Downloads.");
             }
             File target = new File(directory, displayName);
             copyFile(source, target);
@@ -815,7 +815,7 @@ public class YtDlpPlugin extends Plugin {
 
         android.content.ContentResolver resolver = getContext().getContentResolver();
         Uri collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
-        String relativePath = Environment.DIRECTORY_MUSIC + "/Localify Downloads/";
+        String relativePath = Environment.DIRECTORY_MUSIC + "/Crimson Downloads/";
         Uri destination = null;
         String selection = MediaStore.MediaColumns.DISPLAY_NAME + "=? AND "
             + MediaStore.MediaColumns.RELATIVE_PATH + "=?";
@@ -839,7 +839,7 @@ public class YtDlpPlugin extends Plugin {
         } else {
             resolver.update(destination, values, null, null);
         }
-        if (destination == null) throw new IllegalStateException("Android не смог создать файл в Music/Localify Downloads.");
+        if (destination == null) throw new IllegalStateException("Android не смог создать файл в Music/Crimson Downloads.");
 
         try {
             try (java.io.InputStream input = new java.io.FileInputStream(source);
@@ -911,7 +911,7 @@ public class YtDlpPlugin extends Plugin {
     private String text(Object value) { return value == null ? "" : String.valueOf(value); }
     private String safe(String value) { return value == null ? "" : value.trim(); }
     private String fallback(String value, String backup) { return value == null || value.isEmpty() ? (backup == null ? "" : backup) : value; }
-    private boolean validUrl(String value) { String lower=value.toLowerCase(Locale.ROOT); return lower.startsWith("https://") || lower.startsWith("http://"); }
+    private boolean validUrl(String value) { return value != null && value.toLowerCase(Locale.ROOT).startsWith("https://"); }
     private String cleanFilePart(String value) { return value.replaceAll("[^A-Za-z0-9_-]", ""); }
     private String safeMessage(Throwable ex) {
         Throwable current=ex;

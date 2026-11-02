@@ -165,8 +165,8 @@ public final class PlaybackForegroundService extends MediaSessionService {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && manager != null
             && manager.getNotificationChannel(NOTIFICATION_CHANNEL_ID) == null) {
             NotificationChannel channel = new NotificationChannel(
-                NOTIFICATION_CHANNEL_ID, "Музыка Localify", NotificationManager.IMPORTANCE_LOW);
-            channel.setDescription("Управление воспроизведением музыки Localify");
+                NOTIFICATION_CHANNEL_ID, "Музыка Crimson", NotificationManager.IMPORTANCE_LOW);
+            channel.setDescription("Управление воспроизведением музыки Crimson");
             channel.setShowBadge(false);
             manager.createNotificationChannel(channel);
         }
@@ -176,7 +176,7 @@ public final class PlaybackForegroundService extends MediaSessionService {
             : new Notification.Builder(this).setPriority(Notification.PRIORITY_LOW);
         Notification notification = builder
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle("Localify Crimson")
+            .setContentTitle("Crimson")
             .setContentText("Подготовка воспроизведения…")
             .setCategory(Notification.CATEGORY_TRANSPORT)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
@@ -209,7 +209,7 @@ public final class PlaybackForegroundService extends MediaSessionService {
                 String uriText = row.optString("uri", "");
                 if (id.isEmpty() || uriText.isEmpty()) continue;
                 MediaMetadata.Builder metadata = new MediaMetadata.Builder()
-                    .setTitle(row.optString("title", "Localify"))
+                    .setTitle(row.optString("title", "Crimson"))
                     .setArtist(row.optString("artist", "Неизвестный исполнитель"));
                 String artworkUri = row.optString("artworkUri", "");
                 if (!artworkUri.isEmpty()) metadata.setArtworkUri(Uri.parse(artworkUri));
@@ -442,7 +442,7 @@ public final class PlaybackForegroundService extends MediaSessionService {
         result.put("active", true);
         result.put("currentId", currentId);
         result.put("uri", current.optString("uri", ""));
-        result.put("title", current.optString("title", "Localify"));
+        result.put("title", current.optString("title", "Crimson"));
         result.put("artist", current.optString("artist", "Неизвестный исполнитель"));
         result.put("artworkUri", current.optString("artworkUri", ""));
         result.put("playing", prefs.getBoolean(PREF_PLAYING, false));
@@ -505,7 +505,7 @@ public final class PlaybackForegroundService extends MediaSessionService {
 
                 Uri uri = Uri.parse(uriText);
                 MediaMetadata.Builder metadata = new MediaMetadata.Builder()
-                    .setTitle(track.optString("title", "Localify"))
+                    .setTitle(track.optString("title", "Crimson"))
                     .setArtist(track.optString("artist", "Неизвестный исполнитель"));
                 String artwork = track.optString("artworkUri", "");
                 if (!artwork.isEmpty()) {

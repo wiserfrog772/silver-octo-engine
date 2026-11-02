@@ -1,9 +1,50 @@
 (() => {
   'use strict';
 
+  // Technical identifier kept from the previous product name on purpose:
+  // IndexedDB cannot be renamed in place, and changing it would hide every track
+  // that existing installations have already imported.
   const DB_NAME = 'localify-crimson-mobile';
   const DB_VERSION = 1;
   const STORE = 'tracks';
+  const STORAGE_KEYS = {
+    queue: 'crimson.mobile.queue',
+    playlists: 'crimson.mobile.playlists',
+    sort: 'crimson.mobile.sort'
+  };
+  const LEGACY_STORAGE_KEYS = {
+    queue: 'localify.mobile.queue',
+    playlists: 'localify.mobile.playlists'
+  };
+  const SORT_MODES = ['recent', 'title', 'artist'];
+  const collator = new Intl.Collator(['ru', 'en'], { numeric: true, sensitivity: 'base' });
+
+  // Copy data saved under the old brand name to the new keys so the queue and
+  // playlists survive the rename. The old key is removed only after a successful
+  // copy; if the new key already holds real data, the old one is left untouched
+  // rather than risking the loss of unmerged data.
+  function migrateLegacyStorage() {
+    for (const name of Object.keys(LEGACY_STORAGE_KEYS)) {
+      try {
+        const legacyKey = LEGACY_STORAGE_KEYS[name];
+        const legacyValue = localStorage.getItem(legacyKey);
+        if (legacyValue === null) continue;
+        const current = localStorage.getItem(STORAGE_KEYS[name]);
+        if (current === null || current === '[]') {
+          localStorage.setItem(STORAGE_KEYS[name], legacyValue);
+          localStorage.removeItem(legacyKey);
+        }
+      } catch (_) {}
+    }
+  }
+  migrateLegacyStorage();
+
+  function readSortMode() {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEYS.sort);
+      return SORT_MODES.includes(stored) ? stored : 'recent';
+    } catch (_) { return 'recent'; }
+  }
   const $ = (selector) => document.querySelector(selector);
   const state = {
     db: null,
@@ -48,13 +89,14 @@
     resumeOnVisible: false,
     intentionalPausePending: false,
     playerCoverKey: '',
-    searchRenderTimer: null
+    searchRenderTimer: null,
+    sortMode: readSortMode()
   };
   const audio = $('#audio');
   const filePicker = $('#filePicker');
 
   function recordWebDiagnostic(kind, message, stack, source) {
-    const plugin = window.LocalifyPlayback;
+    const plugin = window.CrimsonPlayback;
     if (!plugin || typeof plugin.reportWebError !== 'function') return;
     try {
       const result = plugin.reportWebError({
@@ -242,7 +284,7 @@
   }
 
   async function writeBlobToNative(id, name, blob) {
-    const plugin = window.LocalifyPlayback;
+    const plugin = window.CrimsonPlayback;
     if (!(blob instanceof Blob) || !blob.size || !plugin ||
         typeof plugin.beginTrackTransfer !== 'function' ||
         typeof plugin.appendTrackTransferChunk !== 'function' ||
@@ -441,10 +483,26 @@
 
   function savePlaylists() {
     try {
-      localStorage.setItem('localify.mobile.playlists', JSON.stringify(state.playlists.map((playlist) => ({
+      localStorage.setItem(STORAGE_KEYS.playlists, JSON.stringify(state.playlists.map((playlist) => ({
         id: playlist.id, name: playlist.name, trackIds: playlist.trackIds, createdAt: playlist.createdAt || Date.now()
       }))));
     } catch (_) { showToast('Не удалось сохранить плейлисты на устройстве.'); }
+  }
+
+  function libraryTracks() {
+    const list = state.tracks.slice();
+    if (state.sortMode === 'title') {
+      list.sort((a, b) => collator.compare(a.name || '', b.name || ''));
+    } else if (state.sortMode === 'artist') {
+      list.sort((a, b) => collator.compare(a.artist || '', b.artist || '') || collator.compare(a.name || '', b.name || ''));
+    } else {
+      list.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+    }
+    return list;
+  }
+
+  function libraryOrderIds() {
+    return libraryTracks().map((track) => track.id);
   }
 
   function playbackIdsForView() {
@@ -453,11 +511,11 @@
       if (playlist) return uniqueTrackIds(playlist.trackIds);
     }
     if (state.view === 'queue' && state.playbackOrder.length) return uniqueTrackIds(state.playbackOrder);
-    return state.tracks.map((track) => track.id);
+    return libraryOrderIds();
   }
 
   function viewTracks() {
-    let tracks = state.tracks;
+    let tracks = libraryTracks();
     if (state.view === 'queue') {
       const current = currentTrack();
       const currentId = current && current.id;
@@ -542,8 +600,15 @@
     $('#queueBadge').classList.toggle('hidden', visibleQueueCount === 0);
     $('#sectionTitle').textContent = state.view === 'queue' ? 'Очередь' : 'Моя музыка';
     document.querySelectorAll('.nav-item[data-view]').forEach((button) => {
-      button.classList.toggle('active', button.dataset.view === state.view);
+      const active = button.dataset.view === state.view;
+      button.classList.toggle('active', active);
+      if (active) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
     });
+    const sortSelect = $('#sortSelect');
+    if (sortSelect) {
+      sortSelect.value = state.sortMode;
+      sortSelect.classList.toggle('hidden', state.view === 'queue');
+    }
     if (isYoutube || isSettings || isPlaylists) return;
     if (!tracks.length) { list.innerHTML = emptyMarkup(); return; }
     list.innerHTML = tracks.map((track) => {
@@ -731,7 +796,7 @@
       const metadataKey = String(track.id) + '|' + coverUrl;
       try {
         if (state.lastMediaMetadataKey !== metadataKey) {
-          const metadata = { title: track.name, artist: track.artist || 'Localify Crimson', album: 'Моя музыка' };
+          const metadata = { title: track.name, artist: track.artist || 'Crimson', album: 'Моя музыка' };
           if (coverUrl) metadata.artwork = [{ src: coverUrl, sizes: '512x512', type: 'image/jpeg' }];
           navigator.mediaSession.metadata = new MediaMetadata(metadata);
           state.lastMediaMetadataKey = metadataKey;
@@ -809,12 +874,12 @@
       scheduleLegacyArtworkMigration(deduped.records);
       const ids = new Set(state.tracks.map((track) => track.id));
       try {
-        state.queue = JSON.parse(localStorage.getItem('localify.mobile.queue') || '[]').filter((id) => ids.has(id));
+        state.queue = JSON.parse(localStorage.getItem(STORAGE_KEYS.queue) || '[]').filter((id) => ids.has(id));
       } catch (_) {
         state.queue = [];
       }
       try {
-        const stored = JSON.parse(localStorage.getItem('localify.mobile.playlists') || '[]');
+        const stored = JSON.parse(localStorage.getItem(STORAGE_KEYS.playlists) || '[]');
         state.playlists = Array.isArray(stored) ? stored.filter((item) => item && item.id && String(item.name || '').trim()).map((item) => ({
           id: String(item.id), name: String(item.name).trim().slice(0, 60),
           trackIds: uniqueTrackIds(Array.isArray(item.trackIds) ? item.trackIds : []),
@@ -822,7 +887,7 @@
         })) : [];
       } catch (_) { state.playlists = []; }
       savePlaylists();
-      state.playbackOrder = state.tracks.map((track) => track.id);
+      state.playbackOrder = libraryOrderIds();
       render();
       if (state.pendingNativeSnapshot) {
         const snapshot = state.pendingNativeSnapshot;
@@ -1169,7 +1234,7 @@
   }
 
   function saveQueue() {
-    try { localStorage.setItem('localify.mobile.queue', JSON.stringify(state.queue)); } catch (_) {}
+    try { localStorage.setItem(STORAGE_KEYS.queue, JSON.stringify(state.queue)); } catch (_) {}
   }
 
   function enqueue(id) {
@@ -1179,7 +1244,7 @@
       return;
     }
     state.queue.push(id);
-    if (!state.playbackOrder.length) state.playbackOrder = state.tracks.map((track) => track.id);
+    if (!state.playbackOrder.length) state.playbackOrder = libraryOrderIds();
     saveQueue();
     render();
     showToast('Добавлено в очередь.');
@@ -1190,7 +1255,7 @@
     if (!track) return;
     const wasCurrent = state.currentId === id || (state.currentRemoteTrack && state.currentRemoteTrack.id === id);
     if (wasCurrent && isNativePlaybackNotificationAvailable()) {
-      try { await window.LocalifyPlayback.clear(); } catch (_) {}
+      try { await window.CrimsonPlayback.clear(); } catch (_) {}
       state.nativeQueueOrder = null;
       state.nativeQueueLastKey = '';
     } else if (wasCurrent) {
@@ -1212,10 +1277,10 @@
     try {
       await removeRecord(id);
       if (isNativePlaybackNotificationAvailable() &&
-          window.LocalifyPlayback && typeof window.LocalifyPlayback.deleteTrackFile === 'function') {
+          window.CrimsonPlayback && typeof window.CrimsonPlayback.deleteTrackFile === 'function') {
         const nativeFiles = [track.nativePath, track.coverPath].filter(Boolean);
         for (const path of new Set(nativeFiles)) {
-          try { await window.LocalifyPlayback.deleteTrackFile({ path }); } catch (_) {}
+          try { await window.CrimsonPlayback.deleteTrackFile({ path }); } catch (_) {}
         }
       }
       releaseTrackUrls(track);
@@ -1234,7 +1299,7 @@
       state.playbackOrder = uniqueTrackIds(orderIds);
       if (!state.playbackOrder.includes(id)) state.playbackOrder.unshift(id);
     } else if (!state.playbackOrder.includes(id)) {
-      state.playbackOrder = state.tracks.map((item) => item.id);
+      state.playbackOrder = libraryOrderIds();
       if (!state.playbackOrder.includes(id)) state.playbackOrder.unshift(id);
     }
     const native = isNativePlaybackNotificationAvailable();
@@ -1310,7 +1375,7 @@
       } else {
         const available = playbackIdsForView();
         const firstId = available[0] || (state.tracks[0] && state.tracks[0].id);
-        if (firstId) await playTrack(firstId, available.length ? available : state.tracks.map((item) => item.id));
+        if (firstId) await playTrack(firstId, available.length ? available : libraryOrderIds());
         else {
           filePicker.click();
           showToast('Сначала добавь музыку в медиатеку.');
@@ -1319,7 +1384,7 @@
       return;
     }
     if (isNativePlaybackNotificationAvailable()) {
-      const plugin = window.LocalifyPlayback;
+      const plugin = window.CrimsonPlayback;
       state.nativePosition = currentPlaybackPosition();
       state.nativePositionUpdatedAt = Date.now();
       try {
@@ -1359,13 +1424,13 @@
 
   function orderedIds() {
     const order = uniqueTrackIds(state.playbackOrder);
-    return order.length ? order : state.tracks.map((track) => track.id);
+    return order.length ? order : libraryOrderIds();
   }
 
   async function nextTrack(fromEnded) {
     if (isNativePlaybackNotificationAvailable()) {
       try {
-        await window.LocalifyPlayback.next();
+        await window.CrimsonPlayback.next();
         await refreshNativePlaybackState();
       } catch (_) { showToast('Не удалось переключить следующий трек.'); }
       return;
@@ -1400,7 +1465,7 @@
   async function previousTrack() {
     if (isNativePlaybackNotificationAvailable()) {
       try {
-        await window.LocalifyPlayback.previous();
+        await window.CrimsonPlayback.previous();
         await refreshNativePlaybackState();
       } catch (_) { showToast('Не удалось переключить предыдущий трек.'); }
       return;
@@ -1437,7 +1502,7 @@
   }
 
   function isNativePlaybackNotificationAvailable() {
-    return Boolean(window.LocalifyPlayback && window.Capacitor &&
+    return Boolean(window.CrimsonPlayback && window.Capacitor &&
       typeof window.Capacitor.isNativePlatform === 'function' && window.Capacitor.isNativePlatform());
   }
 
@@ -1551,7 +1616,7 @@
       items.push({
         id: String(item.id),
         uri,
-        title: String(item.name || 'Localify'),
+        title: String(item.name || 'Crimson'),
         artist: String(item.artist || 'Неизвестный исполнитель'),
         artworkUri: nativeArtworkUriForTrack(item)
       });
@@ -1560,7 +1625,7 @@
   }
 
   async function syncNativePlayback(force = false) {
-    const plugin = window.LocalifyPlayback;
+    const plugin = window.CrimsonPlayback;
     if (!plugin || !window.Capacitor || typeof window.Capacitor.isNativePlatform !== 'function' ||
         !window.Capacitor.isNativePlatform()) return;
     const track = currentTrack();
@@ -1593,7 +1658,7 @@
       try {
         await plugin.update({
           active: true,
-          title: track.name || 'Localify',
+          title: track.name || 'Crimson',
           artist: track.artist || 'Неизвестный исполнитель',
           playing: state.isPlaying,
           duration,
@@ -1718,7 +1783,7 @@
       } else {
         // The native service can survive a WebView, but don't keep playing a stale
         // file if its library record was deleted on disk in a prior app session.
-        const plugin = window.LocalifyPlayback;
+        const plugin = window.CrimsonPlayback;
         state.currentId = null;
         state.currentRemoteTrack = null;
         state.isPlaying = false;
@@ -1771,7 +1836,7 @@
   }
 
   async function refreshNativePlaybackState() {
-    const plugin = window.LocalifyPlayback;
+    const plugin = window.CrimsonPlayback;
     if (!isNativePlaybackNotificationAvailable() || !plugin || typeof plugin.getPlaybackState !== 'function') return;
     try {
       applyNativePlaybackState(await plugin.getPlaybackState());
@@ -1779,7 +1844,7 @@
   }
 
   function attachNativePlaybackListener() {
-    const plugin = window.LocalifyPlayback;
+    const plugin = window.CrimsonPlayback;
     if (!plugin || state.nativePlaybackListenerAttached || typeof plugin.addListener !== 'function') return;
     state.nativePlaybackListenerAttached = true;
     plugin.addListener('mediaAction', (event) => {
@@ -1800,7 +1865,7 @@
     if (!document.hidden) void refreshNativePlaybackState();
   }
 
-  window.addEventListener('localify-playback-ready', attachNativePlaybackListener);
+  window.addEventListener('crimson-playback-ready', attachNativePlaybackListener);
   attachNativePlaybackListener();
 
   function importDialog(playlistId = null) {
@@ -1824,7 +1889,7 @@
   $('#resetDownloadFolder').addEventListener('click', resetDownloadFolder);
 
   $('#copyDiagnosticLog').addEventListener('click', async () => {
-    const plugin = window.LocalifyPlayback;
+    const plugin = window.CrimsonPlayback;
     const status = $('#diagnosticStatus');
     const field = $('#diagnosticLogText');
     if (!plugin || typeof plugin.getDiagnosticLog !== 'function') {
@@ -1864,7 +1929,7 @@
   });
 
   $('#clearDiagnosticLog').addEventListener('click', async () => {
-    const plugin = window.LocalifyPlayback;
+    const plugin = window.CrimsonPlayback;
     if (!plugin || typeof plugin.clearDiagnosticLog !== 'function') {
       showToast('Очистка доступна только в установленном Android APK.');
       return;
@@ -1882,6 +1947,12 @@
 
   $('#importTop').addEventListener('click', importDialog);
   filePicker.addEventListener('change', () => importFiles(filePicker.files));
+  $('#sortSelect').addEventListener('change', (event) => {
+    const mode = event.target.value;
+    state.sortMode = SORT_MODES.includes(mode) ? mode : 'recent';
+    try { localStorage.setItem(STORAGE_KEYS.sort, state.sortMode); } catch (_) {}
+    renderList();
+  });
   $('#searchInput').addEventListener('input', (event) => {
     state.query = event.currentTarget.value || '';
     clearTimeout(state.searchRenderTimer);
@@ -1979,7 +2050,7 @@
     if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('[data-action="play"]')) {
       event.preventDefault();
       const playlist = playlistById(state.currentPlaylistId);
-      playTrack(event.target.dataset.id, playlist ? playlist.trackIds : state.tracks.map((track) => track.id));
+      playTrack(event.target.dataset.id, playlist ? playlist.trackIds : libraryOrderIds());
     }
   });
 
@@ -2050,7 +2121,7 @@
   });
 
   $('#queueFromCurrent').addEventListener('click', () => enqueueTracksFromCurrent(
-    state.tracks.map((track) => track.id), 'медиатека'));
+    libraryOrderIds(), 'медиатека'));
 
   $('#createPlaylist').addEventListener('click', () => openPlaylistNameDialog(null));
   $('#cancelPlaylistName').addEventListener('click', () => {
@@ -2132,7 +2203,7 @@
       const id = trackAction.dataset.id;
       if (trackAction.dataset.action === 'play') {
         const playlist = playlistById(state.currentPlaylistId);
-        playTrack(id, playlist ? playlist.trackIds : state.tracks.map((track) => track.id));
+        playTrack(id, playlist ? playlist.trackIds : libraryOrderIds());
       } else if (trackAction.dataset.action === 'enqueue') enqueue(id);
       return;
     }
@@ -2232,7 +2303,7 @@
       if (isNativePlaybackNotificationAvailable()) {
         state.nativePosition = target;
         state.nativePositionUpdatedAt = Date.now();
-        try { await window.LocalifyPlayback.seekTo({ positionMs: Math.round(target * 1000) }); } catch (_) {}
+        try { await window.CrimsonPlayback.seekTo({ positionMs: Math.round(target * 1000) }); } catch (_) {}
       } else {
         audio.currentTime = target;
       }
@@ -2317,7 +2388,7 @@
 
 
   function nativeYtDlp() {
-    return Boolean(window.LocalifyYtDlp && window.Capacitor && typeof window.Capacitor.isNativePlatform === 'function' && window.Capacitor.isNativePlatform());
+    return Boolean(window.CrimsonYtDlp && window.Capacitor && typeof window.Capacitor.isNativePlatform === 'function' && window.Capacitor.isNativePlatform());
   }
 
   async function refreshFolderSettings() {
@@ -2330,9 +2401,9 @@
       return;
     }
     try {
-      const info = await window.LocalifyYtDlp.folderStatus();
+      const info = await window.CrimsonYtDlp.folderStatus();
       library.textContent = info.libraryFolderName ? 'Источник: ' + info.libraryFolderName + '. Разрешение сохранено.' : 'Папка не выбрана. Выбери каталог с музыкой на устройстве.';
-      downloads.textContent = info.downloadFolderName ? 'Загрузки сохраняются в: ' + info.downloadFolderName + '.' : 'По умолчанию: Music/Localify Downloads.';
+      downloads.textContent = info.downloadFolderName ? 'Загрузки сохраняются в: ' + info.downloadFolderName + '.' : 'По умолчанию: Music/Crimson Downloads.';
       ['chooseLibraryFolder','refreshLibraryFolder','chooseDownloadFolder','resetDownloadFolder'].forEach((id) => { const b=$('#'+id); if(b)b.disabled=false; });
     } catch (error) { library.textContent = 'Не удалось получить настройки папок: ' + (error?.message || error); }
   }
@@ -2351,7 +2422,7 @@
     if (!force && state.lastFolderScanAt && Date.now() - state.lastFolderScanAt < 30000) return;
     state.libraryRefreshing = true;
     try {
-      const result = await window.LocalifyYtDlp.scanLibraryFolder();
+      const result = await window.CrimsonYtDlp.scanLibraryFolder();
       if (result.selected === false) {
         state.lastFolderScanAt = Date.now();
         await refreshFolderSettings();
@@ -2439,7 +2510,7 @@
   async function chooseLibraryFolder() {
     if (!nativeYtDlp()) { showToast('Выбор папки доступен только в установленном APK.'); return; }
     try {
-      await window.LocalifyYtDlp.chooseLibraryFolder();
+      await window.CrimsonYtDlp.chooseLibraryFolder();
       await refreshExternalLibrary({ silent: true, force: true });
       showToast('Источник медиатеки обновлён.');
     } catch (error) { if (!String(error?.message || error).toLowerCase().includes('отмен')) showToast('Не удалось выбрать папку: ' + (error?.message || error)); }
@@ -2448,7 +2519,7 @@
   async function chooseDownloadFolder() {
     if (!nativeYtDlp()) { showToast('Выбор папки доступен только в установленном APK.'); return; }
     try {
-      await window.LocalifyYtDlp.chooseDownloadFolder();
+      await window.CrimsonYtDlp.chooseDownloadFolder();
       await refreshFolderSettings();
       showToast('Папка загрузок сохранена.');
     } catch (error) { if (!String(error?.message || error).toLowerCase().includes('отмен')) showToast('Не удалось выбрать папку: ' + (error?.message || error)); }
@@ -2457,9 +2528,9 @@
   async function resetDownloadFolder() {
     if (!nativeYtDlp()) return;
     try {
-      await window.LocalifyYtDlp.resetDownloadFolder();
+      await window.CrimsonYtDlp.resetDownloadFolder();
       await refreshFolderSettings();
-      showToast('Загрузки снова сохраняются в Music/Localify Downloads.');
+      showToast('Загрузки снова сохраняются в Music/Crimson Downloads.');
     } catch (error) { showToast('Не удалось сбросить папку: ' + (error?.message || error)); }
   }
 
@@ -2476,9 +2547,9 @@
     }
     $('#youtubeSearchButton').disabled = false; $('#importCookies').disabled = false; $('#clearCookies').disabled = false;
     try {
-      const info = await window.LocalifyYtDlp.status();
-      ytStatus('youtubedl-android ' + (info.version || 'готов') + ' · скачивание внутри Localify');
-      $('#cookiesStatus').textContent = info.hasCookies ? 'Файл используется для поиска, прослушивания и скачивания в Localify.' : 'Если YouTube блокирует запросы, импортируй cookies.txt в формате Netscape.';
+      const info = await window.CrimsonYtDlp.status();
+      ytStatus('youtubedl-android ' + (info.version || 'готов') + ' · скачивание внутри Crimson');
+      $('#cookiesStatus').textContent = info.hasCookies ? 'Файл используется для поиска, прослушивания и скачивания в Crimson.' : 'Если YouTube блокирует запросы, импортируй cookies.txt в формате Netscape.';
     } catch (error) { ytStatus('Не удалось проверить встроенный загрузчик: ' + (error?.message || error), true); }
   }
   function formatVideoDuration(seconds) {
@@ -2512,10 +2583,10 @@
     const message = String(error && error.message ? error.message : error || 'Неизвестная ошибка').trim();
     const lower = message.toLowerCase();
     if (/java\.util\.hashmap\.get|hashmap\.get takes 1 argument/.test(lower)) {
-      return 'В приложении обнаружена ошибка параметров yt-dlp. Установи последнюю сборку Localify.';
+      return 'В приложении обнаружена ошибка параметров yt-dlp. Установи последнюю сборку Crimson.';
     }
     if (/http error 403|403 forbidden/.test(lower)) {
-      return message + ' YouTube отклонил запрос аудио (403). Повтори после обновления Localify; если ошибка останется, импортируй свежий cookies.txt из сеанса YouTube.';
+      return message + ' YouTube отклонил запрос аудио (403). Повтори после обновления Crimson; если ошибка останется, импортируй свежий cookies.txt из сеанса YouTube.';
     }
     if (/sign in|login required|cookies? required|confirm you.?re not a bot|not a bot|authentication|age.restricted|members.only|private video|captcha|verify you.?re human/.test(lower)) {
       return message + ' Возможно, YouTube требует входа: импортируй cookies.txt в формате Netscape.';
@@ -2546,7 +2617,7 @@
     state.ytQuery = q; state.ytLoading = true; state.ytResults = []; renderOnlineResults();
     $('#youtubeSearchButton').disabled = true; ytStatus('Ищу на YouTube через yt-dlp…');
     try {
-      const result = await window.LocalifyYtDlp.search({ query: q });
+      const result = await window.CrimsonYtDlp.search({ query: q });
       if (requestId !== state.ytSearchRequestId) return;
       const uniqueVideos = new Map();
       for (const item of (Array.isArray(result.results) ? result.results : [])) {
@@ -2578,7 +2649,7 @@
     if (!nativeYtDlp()) { showToast('yt-dlp доступен только в установленном APK.'); return; }
     ytStatus('Получаю аудиопоток: ' + (video.title || 'YouTube') + '…');
     try {
-      const info = await window.LocalifyYtDlp.streamInfo({ url: video.url });
+      const info = await window.CrimsonYtDlp.streamInfo({ url: video.url });
       if (!info.url) throw new Error('yt-dlp не вернул аудиопоток.');
       state.currentId = null;
       state.nativeQueueOrder = null;
@@ -2607,9 +2678,9 @@
   async function downloadYoutubeVideo(video) {
     if (!nativeYtDlp()) { showToast('Скачивание доступно в установленном Android APK.'); return; }
     state.ytDownloads[video.id] = {status:'downloading',progress:0}; renderOnlineResults();
-    ytStatus('Скачиваю аудио в Localify: ' + (video.title || 'YouTube') + '…');
+    ytStatus('Скачиваю аудио в Crimson: ' + (video.title || 'YouTube') + '…');
     try {
-      const saved = await window.LocalifyYtDlp.downloadAudio({
+      const saved = await window.CrimsonYtDlp.downloadAudio({
         id: video.id,
         url: video.url,
         title: video.title || 'YouTube',
@@ -2644,7 +2715,7 @@
       else state.tracks.unshift(attached);
       state.ytDownloads[video.id] = {status:'done',progress:100,format:String(saved.format || '')};
       render();
-      ytStatus('Скачано в медиатеку Localify: ' + record.name + ' · формат: ' + (saved.format || 'не указан'));
+      ytStatus('Скачано в медиатеку Crimson: ' + record.name + ' · формат: ' + (saved.format || 'не указан'));
       showToast('Трек скачан (' + (saved.format || 'формат не указан') + ') и добавлен в медиатеку');
     } catch (error) {
       state.ytDownloads[video.id] = {status:'error',progress:0};
@@ -2665,19 +2736,19 @@
     try {
       const contents = await file.text();
       if (!contents.includes('# Netscape HTTP Cookie File') && !contents.includes('# HTTP Cookie File')) throw new Error('Файл не похож на cookies.txt в формате Netscape.');
-      const result = await window.LocalifyYtDlp.saveCookies({content:contents});
-      $('#cookiesStatus').textContent = 'cookies.txt импортирован (' + (result.count || 'готово') + ' строк) для поиска, прослушивания и скачивания в Localify.';
+      const result = await window.CrimsonYtDlp.saveCookies({content:contents});
+      $('#cookiesStatus').textContent = 'cookies.txt импортирован (' + (result.count || 'готово') + ' строк) для поиска, прослушивания и скачивания в Crimson.';
       ytStatus('Cookies сохранены в приватном каталоге приложения.');
     } catch (error) { ytStatus('Не удалось импортировать cookies.txt: ' + (error?.message || error), true); }
     finally { event.currentTarget.value = ''; }
   });
   $('#clearCookies').addEventListener('click', async () => {
     if (!nativeYtDlp()) return;
-    try { await window.LocalifyYtDlp.clearCookies(); $('#cookiesStatus').textContent = 'Cookies Localify удалены.'; ytStatus('cookies.txt удалён.'); }
+    try { await window.CrimsonYtDlp.clearCookies(); $('#cookiesStatus').textContent = 'Cookies Crimson удалены.'; ytStatus('cookies.txt удалён.'); }
     catch (error) { ytStatus('Не удалось удалить cookies.txt: ' + (error?.message || error), true); }
   });
   function attachDownloadProgressListener() {
-    const plugin = window.LocalifyYtDlp;
+    const plugin = window.CrimsonYtDlp;
     if (!plugin || typeof plugin.addListener !== 'function' || state.downloadListenerAttached) return;
     state.downloadListenerAttached = true;
     plugin.addListener('downloadProgress', (event) => {
@@ -2688,7 +2759,7 @@
     });
   }
 
-  window.addEventListener('localify-yt-dlp-ready', () => {
+  window.addEventListener('crimson-yt-dlp-ready', () => {
     attachDownloadProgressListener();
     if (state.db) void refreshFolderSettings();
   });

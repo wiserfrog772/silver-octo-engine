@@ -7,7 +7,6 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
@@ -23,7 +22,6 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.PluginMethod;
 
-import java.io.InputStream;
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.FileWriter;
@@ -35,14 +33,12 @@ import java.util.Date;
 import java.util.Locale;
 import java.io.File;
 import java.io.FileOutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.lang.ref.WeakReference;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import org.json.JSONObject;
 
-@CapacitorPlugin(name = "LocalifyPlayback")
+@CapacitorPlugin(name = "CrimsonPlayback")
 public class PlaybackNotificationPlugin extends Plugin {
     public static final String ACTION_PLAY = "com.localify.crimson.playback.PLAY";
     public static final String ACTION_PAUSE = "com.localify.crimson.playback.PAUSE";
@@ -156,7 +152,7 @@ public class PlaybackNotificationPlugin extends Plugin {
             error.printStackTrace(new PrintWriter(buffer));
             appendDiagnostic(context, "UNCAUGHT_EXCEPTION",
                 "Thread: " + thread.getName() + "\n" + buffer);
-            Log.e("LocalifyCrash", "Uncaught exception on " + thread.getName(), error);
+            Log.e("CrimsonCrash", "Uncaught exception on " + thread.getName(), error);
             if (previous != null) previous.uncaughtException(thread, error);
         });
     }
@@ -185,7 +181,7 @@ public class PlaybackNotificationPlugin extends Plugin {
             }
             try (FileWriter writer = new FileWriter(file, false)) { writer.write(combined); }
         } catch (IOException error) {
-            Log.w("LocalifyCrash", "Could not write diagnostic log", error);
+            Log.w("CrimsonCrash", "Could not write diagnostic log", error);
         }
     }
 
@@ -347,8 +343,8 @@ public class PlaybackNotificationPlugin extends Plugin {
     private void createNotificationChannel(Context context) {
         if (Build.VERSION.SDK_INT < 26 || notificationManager == null) return;
         NotificationChannel channel = new NotificationChannel(
-            CHANNEL_ID, "Музыка Localify", NotificationManager.IMPORTANCE_LOW);
-        channel.setDescription("Управление воспроизведением музыки Localify");
+            CHANNEL_ID, "Музыка Crimson", NotificationManager.IMPORTANCE_LOW);
+        channel.setDescription("Управление воспроизведением музыки Crimson");
         channel.setShowBadge(false);
         notificationManager.createNotificationChannel(channel);
     }
@@ -367,7 +363,7 @@ public class PlaybackNotificationPlugin extends Plugin {
         MediaMetadata.Builder metadata = new MediaMetadata.Builder()
             .putString(MediaMetadata.METADATA_KEY_TITLE, trackTitle)
             .putString(MediaMetadata.METADATA_KEY_ARTIST, trackArtist)
-            .putString(MediaMetadata.METADATA_KEY_ALBUM, "Localify Crimson")
+            .putString(MediaMetadata.METADATA_KEY_ALBUM, "Crimson")
             .putLong(MediaMetadata.METADATA_KEY_DURATION, trackDurationMs);
         Bitmap artwork = trackArtwork;
         if (artwork != null && !artwork.isRecycled()) {
@@ -425,7 +421,7 @@ public class PlaybackNotificationPlugin extends Plugin {
             ? new Notification.Builder(context, CHANNEL_ID)
             : new Notification.Builder(context).setPriority(Notification.PRIORITY_LOW);
         builder.setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle("Localify Crimson")
+            .setContentTitle("Crimson")
             .setContentText("Воспроизведение музыки")
             .setCategory(Notification.CATEGORY_TRANSPORT)
             .setOngoing(true)
@@ -445,44 +441,6 @@ public class PlaybackNotificationPlugin extends Plugin {
         // Starting is deliberately left to setQueue(): MediaSessionService then receives a
         // complete queue and can promote itself while the first item begins playing, without
         // starting an empty foreground service during potentially large local-file transfers.
-    }
-
-    private void loadArtworkAsync(String path, String url) {
-        if ((path == null || path.isEmpty()) && (url == null || !url.startsWith("https://"))) return;
-        new Thread(() -> {
-            Bitmap bitmap = null;
-            try {
-                if (path != null && !path.isEmpty()) {
-                    String filePath = path.startsWith("file://") ? android.net.Uri.parse(path).getPath() : path;
-                    BitmapFactory.Options bounds = new BitmapFactory.Options();
-                    bounds.inJustDecodeBounds = true;
-                    BitmapFactory.decodeFile(filePath, bounds);
-                    int sample = 1;
-                    while (bounds.outWidth / sample > 512 || bounds.outHeight / sample > 512) sample *= 2;
-                    BitmapFactory.Options options = new BitmapFactory.Options();
-                    options.inSampleSize = sample;
-                    bitmap = BitmapFactory.decodeFile(filePath, options);
-                }
-                if (bitmap == null && url != null && url.startsWith("https://")) {
-                    HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
-                    connection.setConnectTimeout(4500);
-                    connection.setReadTimeout(4500);
-                    connection.setInstanceFollowRedirects(true);
-                    try (InputStream input = connection.getInputStream()) {
-                        bitmap = BitmapFactory.decodeStream(input);
-                    } finally {
-                        connection.disconnect();
-                    }
-                }
-            } catch (Exception ignored) {}
-            if (!url.equals(trackCoverUrl) || !path.equals(trackCoverPath)) {
-                if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
-                return;
-            }
-            trackArtwork = bitmap;
-            publishNotification();
-            syncPlaybackService();
-        }, "Localify-Cover-Loader").start();
     }
 
     private static PendingIntent actionPendingIntent(Context context, String action, int requestCode) {

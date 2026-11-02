@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#111013">
   <meta name="color-scheme" content="dark">
-  <title>Localify Crimson</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data: blob:; media-src 'self' https: blob: data:; connect-src 'self' https: blob: data:; object-src 'none'; base-uri 'none'; form-action 'self'">
+  <title>Crimson</title>
   <link rel="stylesheet" href="./styles.css">
   <link rel="stylesheet" href="./crimson-theme.css">
 </head>
@@ -13,8 +14,8 @@
   <div class="app-shell">
     <header class="topbar">
       <div class="brand">
-        <div class="brand-mark"><img src="./assets/mark.png" alt="Localify Crimson"></div>
-        <div><div class="brand-name">LOCALIFY <span>CRIMSON</span></div><div class="brand-caption">ТВОЯ МУЗЫКА. ТВОЁ УСТРОЙСТВО.</div></div>
+        <div class="brand-mark"><img src="./assets/mark.png" alt="Crimson"></div>
+        <div><div class="brand-name"><span>CRIMSON</span></div><div class="brand-caption">ТВОЯ МУЗЫКА. ТВОЁ УСТРОЙСТВО.</div></div>
       </div>
       <button id="importTop" class="icon-button import-top" aria-label="Добавить аудиофайлы" title="Добавить аудиофайлы">
         <svg viewBox="0 0 24 24"><path d="M12 15V3m0 0L7.5 7.5M12 3l4.5 4.5M4 14.5v4A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5v-4"/></svg>
@@ -25,7 +26,7 @@
       <section id="librarySection" class="library-section">
         <div class="section-heading library-heading">
           <div><div class="eyebrow">ТВОЯ КОЛЛЕКЦИЯ</div><h2 id="sectionTitle">Моя музыка</h2></div>
-          <div class="library-heading-actions"><div class="track-count" id="trackCount">0 треков</div><button id="queueFromCurrent" class="secondary-button queue-current-button" type="button">В очередь от текущего</button></div>
+          <div class="library-heading-actions"><div class="track-count" id="trackCount">0 треков</div><select id="sortSelect" class="sort-select" aria-label="Порядок сортировки медиатеки"><option value="recent">Сначала новые</option><option value="title">По названию</option><option value="artist">По исполнителю</option></select><button id="queueFromCurrent" class="secondary-button queue-current-button" type="button">В очередь от текущего</button></div>
         </div>
         <label class="search-box" for="searchInput">
           <svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4 4"/></svg>
@@ -48,7 +49,7 @@
           <div><div class="eyebrow">НАСТРОЙКИ ХРАНИЛИЩА</div><h2>Настройки</h2></div>
         </div>
         <article class="settings-card">
-          <div class="settings-card-title"><span class="settings-symbol">♫</span><div><h3>Источник медиатеки</h3><p>Выбери папку с музыкой. Скачанные в Localify треки автоматически добавляются в медиатеку, а копии можно экспортировать в выбранную папку.</p></div></div>
+          <div class="settings-card-title"><span class="settings-symbol">♫</span><div><h3>Источник медиатеки</h3><p>Выбери папку с музыкой. Скачанные в Crimson треки автоматически добавляются в медиатеку, а копии можно экспортировать в выбранную папку.</p></div></div>
           <div id="libraryFolderSummary" class="settings-status">Папка не выбрана. Используется медиатека, добавленная вручную или скачанная в приложении.</div>
           <div class="settings-actions">
             <button id="chooseLibraryFolder" type="button" class="primary-button">Выбрать папку</button>
@@ -56,15 +57,15 @@
           </div>
         </article>
         <article class="settings-card">
-          <div class="settings-card-title"><span class="settings-symbol">↓</span><div><h3>Папка загрузок</h3><p>После скачивания Localify сохраняет трек во внутренней медиатеке и копирует его в выбранную папку Android.</p></div></div>
-          <div id="downloadFolderSummary" class="settings-status">По умолчанию: приватная папка приложения Localify.</div>
+          <div class="settings-card-title"><span class="settings-symbol">↓</span><div><h3>Папка загрузок</h3><p>После скачивания Crimson сохраняет трек во внутренней медиатеке и копирует его в выбранную папку Android.</p></div></div>
+          <div id="downloadFolderSummary" class="settings-status">По умолчанию: приватная папка приложения Crimson.</div>
           <div class="settings-actions">
             <button id="chooseDownloadFolder" type="button" class="primary-button">Выбрать папку загрузок</button>
             <button id="resetDownloadFolder" type="button" class="secondary-button">Папка по умолчанию</button>
           </div>
         </article>
         <article class="settings-card">
-          <div class="settings-card-title"><span class="settings-symbol">⇅</span><div><h3>Скачивание аудио</h3><p>Localify автоматически выбирает лучшую доступную аудиодорожку. Если её не удаётся скачать, приложение преобразует аудио в MP3. Видео не загружается.</p></div></div>
+          <div class="settings-card-title"><span class="settings-symbol">⇅</span><div><h3>Скачивание аудио</h3><p>Crimson автоматически выбирает лучшую доступную аудиодорожку. Если её не удаётся скачать, приложение преобразует аудио в MP3. Видео не загружается.</p></div></div>
         </article>
         <article class="settings-card">
           <div class="settings-card-title"><span class="settings-symbol">!</span><div><h3>Диагностика закрытия приложения</h3><p>Если приложение неожиданно закроется, журнал сохранит Java-ошибки, ошибки интерфейса и состояние фоновой службы при остановке. Журнал хранится только на устройстве.</p></div></div>
@@ -83,7 +84,7 @@
           <div><div class="eyebrow">ОНЛАЙН ПОИСК</div><h2>Музыка из YouTube</h2></div>
           <span class="track-count">yt-dlp</span>
         </div>
-        <p class="online-intro">Ищи музыку, слушай превью и скачивай аудио прямо в Localify. Готовый трек автоматически добавляется в медиатеку.</p>
+        <p class="online-intro">Ищи музыку, слушай превью и скачивай аудио прямо в Crimson. Готовый трек автоматически добавляется в медиатеку.</p>
         <form id="youtubeSearchForm" class="youtube-search">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4 4"/></svg>
           <input id="youtubeQuery" type="search" placeholder="Название трека или исполнитель" autocomplete="off" maxlength="180">
@@ -96,7 +97,7 @@
           <div class="cookies-copy"><b>Доступ к YouTube</b><span id="cookiesStatus">Если YouTube просит войти в аккаунт, импортируй cookies.txt в формате Netscape.</span></div>
           <div class="cookies-actions"><button id="importCookies" class="secondary-button" type="button">Импорт cookies.txt</button><button id="clearCookies" class="ghost-button" type="button">Очистить</button></div>
         </div>
-        <p class="provider-footnote">Поиск, потоковое воспроизведение и загрузка выполняются встроенным yt-dlp внутри APK. Файлы сохраняются в медиатеку Localify; при необходимости выбери папку экспорта в настройках. Если YouTube требует авторизацию, импортируй cookies.txt выше.</p>
+        <p class="provider-footnote">Поиск, потоковое воспроизведение и загрузка выполняются встроенным yt-dlp внутри APK. Файлы сохраняются в медиатеку Crimson; при необходимости выбери папку экспорта в настройках. Если YouTube требует авторизацию, импортируй cookies.txt выше.</p>
       </section>
     </main>
 
@@ -126,7 +127,7 @@
       <button id="closeFullPlayer" class="full-player-close" type="button" aria-label="Свернуть полноэкранный плеер">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><span>Свернуть</span>
       </button>
-      <div class="full-player-brand">LOCALIFY <span>CRIMSON</span></div>
+      <div class="full-player-brand"><span>CRIMSON</span></div>
       <span class="full-player-top-spacer" aria-hidden="true"></span>
     </div>
     <div class="player-track-row">
