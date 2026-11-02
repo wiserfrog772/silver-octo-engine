@@ -482,3 +482,6 @@ body.player-overlay-open .bottom-nav { visibility: hidden; }
 .sort-select { min-height:34px; max-width:100%; padding:0 26px 0 10px; border:1px solid rgba(224,31,44,.35); border-radius:10px; background:rgba(224,31,44,.16); color:#ffe9ec; font:inherit; font-size:10px; font-weight:750; cursor:pointer; }
 .sort-select:focus-visible { outline:2px solid #ff8d9a; outline-offset:2px; }
 .sort-select option { background:#1a0b10; color:#ffe9ec; }
+
+.playlist-search-box { margin: 0 0 14px; }
+.playlist-search-box input { font-size: 12px; }

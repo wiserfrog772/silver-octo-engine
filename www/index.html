@@ -41,6 +41,10 @@
           <div><div class="eyebrow">ТВОИ ПОДБОРКИ</div><h2>Плейлисты</h2></div>
           <button id="createPlaylist" class="primary-button create-playlist-button" type="button">＋ Создать</button>
         </div>
+        <label class="search-box playlist-search-box" for="playlistSearchInput">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4 4"/></svg>
+          <input id="playlistSearchInput" type="search" placeholder="Найти плейлист или трек" autocomplete="off" maxlength="100">
+        </label>
         <div id="playlistContent"></div>
       </section>
 
@@ -95,7 +99,8 @@
         <div class="cookies-panel">
           <div class="cookies-icon"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 3v6l4 2"/><path d="M16.5 3.5h4v4"/></svg></div>
           <div class="cookies-copy"><b>Доступ к YouTube</b><span id="cookiesStatus">Если YouTube просит войти в аккаунт, импортируй cookies.txt в формате Netscape.</span></div>
-          <div class="cookies-actions"><button id="importCookies" class="secondary-button" type="button">Импорт cookies.txt</button><button id="clearCookies" class="ghost-button" type="button">Очистить</button></div>
+          <div class="cookies-actions"><button id="importCookies" class="secondary-button" type="button">Импорт / заменить cookies.txt</button><button id="clearCookies" class="ghost-button" type="button">Очистить</button></div>
+          <div class="cookies-actions"><button id="updateYtDlp" class="ghost-button" type="button">Проверить обновление yt-dlp</button></div>
         </div>
         <p class="provider-footnote">Поиск, потоковое воспроизведение и загрузка выполняются встроенным yt-dlp внутри APK. Файлы сохраняются в медиатеку Crimson; при необходимости выбери папку экспорта в настройках. Если YouTube требует авторизацию, импортируй cookies.txt выше.</p>
       </section>
@@ -168,6 +173,6 @@
   <input id="cookiesPicker" class="visually-hidden" type="file" accept=".txt,text/plain">
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="./native-bridge.bundle.js"></script>
-  <script src="./app.js"></script>
+  <script type="module" src="./app.js"></script>
 </body>
 </html>

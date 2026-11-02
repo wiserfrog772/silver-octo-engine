@@ -1,3 +1,9 @@
+import { createLibraryStore, migratePreferenceKeys } from './modules/storage.mjs';
+import { cleanTrackTitle, cleanArtistName } from './modules/music-metadata.mjs';
+import { uniqueExistingTrackIds, sortLibraryTracks, playbackIdsForView as resolvePlaybackIds, filterPlaylistCards, filterPlaylistTracks } from './modules/player.mjs';
+import { escapeHtml, formatTimeLabel, pluralTrackCount } from './modules/ui.mjs';
+import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies } from './modules/youtube.mjs';
+
 (() => {
   'use strict';
 
@@ -17,27 +23,10 @@
     playlists: 'localify.mobile.playlists'
   };
   const SORT_MODES = ['recent', 'title', 'artist'];
+  const libraryStore = createLibraryStore({ databaseName: DB_NAME, version: DB_VERSION, storeName: STORE });
   const collator = new Intl.Collator(['ru', 'en'], { numeric: true, sensitivity: 'base' });
 
-  // Copy data saved under the old brand name to the new keys so the queue and
-  // playlists survive the rename. The old key is removed only after a successful
-  // copy; if the new key already holds real data, the old one is left untouched
-  // rather than risking the loss of unmerged data.
-  function migrateLegacyStorage() {
-    for (const name of Object.keys(LEGACY_STORAGE_KEYS)) {
-      try {
-        const legacyKey = LEGACY_STORAGE_KEYS[name];
-        const legacyValue = localStorage.getItem(legacyKey);
-        if (legacyValue === null) continue;
-        const current = localStorage.getItem(STORAGE_KEYS[name]);
-        if (current === null || current === '[]') {
-          localStorage.setItem(STORAGE_KEYS[name], legacyValue);
-          localStorage.removeItem(legacyKey);
-        }
-      } catch (_) {}
-    }
-  }
-  migrateLegacyStorage();
+  migratePreferenceKeys(localStorage, STORAGE_KEYS, LEGACY_STORAGE_KEYS);
 
   function readSortMode() {
     try {
@@ -61,6 +50,7 @@
     playbackOrder: [],
     playlists: [],
     currentPlaylistId: null,
+    playlistQuery: '',
     editingPlaylistId: null,
     pendingPlaylistTrackId: null,
     pendingImportPlaylistId: null,
@@ -134,67 +124,19 @@
     return 'track-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
   }
 
-  function openDatabase() {
-    return new Promise((resolve, reject) => {
-      if (!('indexedDB' in window)) {
-        reject(new Error('Это устройство не поддерживает локальное хранилище медиатеки.'));
-        return;
-      }
-      const request = indexedDB.open(DB_NAME, DB_VERSION);
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'id' });
-      };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error || new Error('Не удалось открыть медиатеку.'));
-    });
-  }
-
-  function getAllRecords() {
-    return new Promise((resolve, reject) => {
-      const request = state.db.transaction(STORE, 'readonly').objectStore(STORE).getAll();
-      request.onsuccess = () => resolve(request.result || []);
-      request.onerror = () => reject(request.error);
-    });
-  }
-
-  function putRecord(record) {
-    return putRecords([record]);
-  }
-
-  function putRecords(records) {
-    return new Promise((resolve, reject) => {
-      if (!state.db || !records.length) { resolve(); return; }
-      const tx = state.db.transaction(STORE, 'readwrite');
-      const store = tx.objectStore(STORE);
-      records.forEach((record) => store.put(record));
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error || new Error('Не удалось сохранить треки.'));
-      tx.onabort = () => reject(tx.error || new Error('Сохранение отменено.'));
-    });
-  }
-
-  function removeRecord(id) {
-    return removeRecords([id]);
-  }
-
-  function removeRecords(ids) {
-    return new Promise((resolve, reject) => {
-      if (!state.db || !ids.length) { resolve(); return; }
-      const tx = state.db.transaction(STORE, 'readwrite');
-      const store = tx.objectStore(STORE);
-      ids.forEach((id) => store.delete(id));
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error || new Error('Не удалось удалить дубликаты.'));
-      tx.onabort = () => reject(tx.error || new Error('Удаление отменено.'));
-    });
-  }
+  function openDatabase() { return libraryStore.open(); }
+  function getAllRecords() { return libraryStore.getAll(state.db); }
+  function putRecord(record) { return putRecords([record]); }
+  function putRecords(records) { return libraryStore.putMany(state.db, records); }
+  function removeRecord(id) { return removeRecords([id]); }
+  function removeRecords(ids) { return libraryStore.removeMany(state.db, ids); }
 
   function storedShape(track) {
     return {
       id: track.id, name: track.name, artist: track.artist, blob: track.blob || null,
       fileName: track.fileName || '', nativePath: track.nativePath || '', sourceId: track.sourceId || '', addedAt: track.addedAt,
       duration: Number(track.duration) || 0, size: Number(track.size) || 0,
+      album: track.album || '', year: track.year || '', genre: track.genre || '',
       importKey: track.importKey || '', youtubeId: track.youtubeId || '', coverBlob: track.coverBlob || null,
       coverUrl: track.coverUrl || '', coverPath: track.coverPath || '',
       coverChecked: track.coverChecked === true,
@@ -411,27 +353,9 @@
     };
   }
 
-  function esc(value) {
-    return String(value == null ? '' : value).replace(/[&<>"']/g, (char) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[char]));
-  }
-
-  function formatTime(seconds) {
-    const value = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
-    const minutes = Math.floor(value / 60);
-    const remainder = value % 60;
-    return minutes + ':' + String(remainder).padStart(2, '0');
-  }
-
-  function pluralTracks(count) {
-    const n = Math.abs(count) % 100;
-    const last = n % 10;
-    if (n > 10 && n < 20) return count + ' треков';
-    if (last > 1 && last < 5) return count + ' трека';
-    if (last === 1) return count + ' трек';
-    return count + ' треков';
-  }
+  const esc = escapeHtml;
+  const formatTime = formatTimeLabel;
+  const pluralTracks = pluralTrackCount;
 
   function showToast(message) {
     const toast = $('#toast');
@@ -446,22 +370,7 @@
   }
 
   function cleanYouTubeTitle(title, videoId) {
-    let cleaned = String(title || '').trim();
-    const id = String(videoId || '').trim();
-    if (/^[A-Za-z0-9_-]{11}$/.test(id)) {
-      for (const suffix of ['[' + id + ']', '(' + id + ')']) {
-        if (cleaned.toLocaleLowerCase().endsWith(suffix.toLocaleLowerCase())) {
-          cleaned = cleaned.slice(0, -suffix.length).trim();
-          break;
-        }
-      }
-    }
-    // The folder scanner sees the source ID in the filename, not as separate metadata.
-    cleaned = cleaned
-      .replace(/\s+\[[A-Za-z0-9_-]{11}\]\s*$/, '')
-      .replace(/\s+\([A-Za-z0-9_-]{11}\)\s*$/, '')
-      .trim();
-    return cleaned || 'YouTube';
+    return cleanTrackTitle(title, videoId) || 'YouTube';
   }
 
   function currentTrack() {
@@ -473,12 +382,7 @@
   }
 
   function uniqueTrackIds(ids) {
-    const seen = new Set();
-    return (Array.isArray(ids) ? ids : []).filter((id) => {
-      if (!trackById(id) || seen.has(id)) return false;
-      seen.add(id);
-      return true;
-    });
+    return uniqueExistingTrackIds(ids, (id) => !!trackById(id));
   }
 
   function savePlaylists() {
@@ -490,15 +394,7 @@
   }
 
   function libraryTracks() {
-    const list = state.tracks.slice();
-    if (state.sortMode === 'title') {
-      list.sort((a, b) => collator.compare(a.name || '', b.name || ''));
-    } else if (state.sortMode === 'artist') {
-      list.sort((a, b) => collator.compare(a.artist || '', b.artist || '') || collator.compare(a.name || '', b.name || ''));
-    } else {
-      list.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
-    }
-    return list;
+    return sortLibraryTracks(state.tracks, state.sortMode, collator);
   }
 
   function libraryOrderIds() {
@@ -506,12 +402,13 @@
   }
 
   function playbackIdsForView() {
-    if (state.view === 'playlists') {
-      const playlist = playlistById(state.currentPlaylistId);
-      if (playlist) return uniqueTrackIds(playlist.trackIds);
-    }
-    if (state.view === 'queue' && state.playbackOrder.length) return uniqueTrackIds(state.playbackOrder);
-    return libraryOrderIds();
+    return resolvePlaybackIds({
+      view: state.view,
+      playlist: playlistById(state.currentPlaylistId),
+      playbackOrder: state.playbackOrder,
+      libraryOrder: libraryOrderIds(),
+      uniqueIds: uniqueTrackIds
+    });
   }
 
   function viewTracks() {
@@ -655,10 +552,13 @@
     if (!root) return;
     const playlist = playlistById(state.currentPlaylistId);
     if (playlist) {
-      const tracks = uniqueTrackIds(playlist.trackIds).map(trackById).filter(Boolean);
+      const allTracks = uniqueTrackIds(playlist.trackIds).map(trackById).filter(Boolean);
+      const tracks = filterPlaylistTracks(allTracks, state.playlistQuery);
       const content = tracks.length
         ? '<div class="track-list playlist-track-list">' + tracks.map(renderPlaylistTrack).join('') + '</div>'
-        : '<div class="empty-state playlist-drop-target" data-playlist-drop="' + esc(playlist.id) + '"><div class="empty-glyph">♫</div><h3>Плейлист пуст</h3><p>Добавь файлы музыки сюда или нажми кнопку добавления. Добавленные треки останутся и в общей медиатеке.</p><button class="primary-button" data-playlist-action="add-music" data-id="' + esc(playlist.id) + '" type="button">＋ Добавить музыку</button><button class="secondary-button" data-playlist-action="back" type="button">Моя музыка</button></div>';
+        : (allTracks.length
+          ? '<div class="empty-state"><h3>Ничего не найдено</h3><p>Измени запрос поиска по трекам или исполнителям.</p></div>'
+          : '<div class="empty-state playlist-drop-target" data-playlist-drop="' + esc(playlist.id) + '"><div class="empty-glyph">♫</div><h3>Плейлист пуст</h3><p>Добавь файлы музыки сюда или нажми кнопку добавления. Добавленные треки останутся и в общей медиатеке.</p><button class="primary-button" data-playlist-action="add-music" data-id="' + esc(playlist.id) + '" type="button">＋ Добавить музыку</button><button class="secondary-button" data-playlist-action="back" type="button">Моя музыка</button></div>');
       root.innerHTML = '<div class="playlist-detail playlist-drop-target" data-playlist-drop="' + esc(playlist.id) + '"><div class="playlist-detail-heading">' +
         '<button class="secondary-button playlist-back-button" data-playlist-action="back" type="button">← Все плейлисты</button>' +
         '<div class="playlist-detail-copy"><h3>' + esc(playlist.name) + '</h3><span>' + pluralTracks(tracks.length) + '</span></div>' +
@@ -676,7 +576,12 @@
       root.innerHTML = '<div class="empty-state"><div class="empty-glyph">♫</div><h3>Создай свой первый плейлист</h3><p>Собери музыку по настроению, жанру или случаю. Плейлисты сохраняются на этом устройстве.</p><button class="primary-button" data-playlist-action="create" type="button">＋ Создать плейлист</button></div>';
       return;
     }
-    root.innerHTML = '<div class="playlist-grid">' + state.playlists.map((item) => {
+    const visiblePlaylists = filterPlaylistCards(state.playlists, state.playlistQuery);
+    if (!visiblePlaylists.length) {
+      root.innerHTML = '<div class="empty-state"><h3>Плейлисты не найдены</h3><p>Попробуй изменить поисковый запрос.</p></div>';
+      return;
+    }
+    root.innerHTML = '<div class="playlist-grid">' + visiblePlaylists.map((item) => {
       const count = uniqueTrackIds(item.trackIds).length;
       return '<article class="playlist-card" data-playlist-card="' + esc(item.id) + '">' +
         '<button class="playlist-card-open" data-playlist-action="open" data-id="' + esc(item.id) + '" type="button" aria-label="Открыть плейлист ' + esc(item.name) + '">' +
@@ -2046,6 +1951,11 @@
     }
   });
 
+  $('#playlistSearchInput').addEventListener('input', (event) => {
+    state.playlistQuery = event.currentTarget.value;
+    renderPlaylists();
+  });
+
   $('#playlistContent').addEventListener('keydown', (event) => {
     if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('[data-action="play"]')) {
       event.preventDefault();
@@ -2542,16 +2452,45 @@
   async function refreshYtDlpStatus() {
     if (!nativeYtDlp()) {
       ytStatus('Для поиска и скачивания через yt-dlp установи APK на Android.', true);
-      $('#youtubeSearchButton').disabled = true; $('#importCookies').disabled = true; $('#clearCookies').disabled = true;
+      $('#youtubeSearchButton').disabled = true; $('#importCookies').disabled = true; $('#clearCookies').disabled = true; $('#updateYtDlp').disabled = true;
       return;
     }
-    $('#youtubeSearchButton').disabled = false; $('#importCookies').disabled = false; $('#clearCookies').disabled = false;
+    $('#youtubeSearchButton').disabled = false; $('#importCookies').disabled = false; $('#clearCookies').disabled = false; $('#updateYtDlp').disabled = false;
     try {
       const info = await window.CrimsonYtDlp.status();
-      ytStatus('youtubedl-android ' + (info.version || 'готов') + ' · скачивание внутри Crimson');
+      const runtimeVersion = info.runtimeVersion || info.ytDlpVersion || 'версия уточняется при запуске';
+      ytStatus('yt-dlp ' + runtimeVersion + ' · runtime youtubedl-android ' + (info.version || 'готов'));
       $('#cookiesStatus').textContent = info.hasCookies ? 'Файл используется для поиска, прослушивания и скачивания в Crimson.' : 'Если YouTube блокирует запросы, импортируй cookies.txt в формате Netscape.';
-    } catch (error) { ytStatus('Не удалось проверить встроенный загрузчик: ' + (error?.message || error), true); }
+    } catch (error) { ytStatus('Не удалось проверить встроенный загрузчик: ' + ytErrorMessage(error), true); }
   }
+
+  async function updateYtDlp() {
+    if (!nativeYtDlp() || typeof window.CrimsonYtDlp.updateYtDlp !== 'function') {
+      ytStatus('Обновление встроенного yt-dlp недоступно в этой сборке.', true);
+      return;
+    }
+    const button = $('#updateYtDlp');
+    if (button) button.disabled = true;
+    ytStatus('Проверяю стабильное обновление yt-dlp…');
+    try {
+      const result = await window.CrimsonYtDlp.updateYtDlp();
+      const version = result.runtimeVersion || 'версия уточняется';
+      if (result.status === 'ERROR' || result.status === 'UNKNOWN') {
+        ytStatus('Обновление yt-dlp не удалось. Используется текущая версия · ' + version, true);
+        return;
+      }
+      const status = result.status === 'DONE' ? 'yt-dlp обновлён' : 'yt-dlp уже актуален';
+      ytStatus(status + ' · ' + version);
+      showToast(status + '.');
+    } catch (error) {
+      ytStatus('Не удалось обновить yt-dlp: ' + ytErrorMessage(error), true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  $('#updateYtDlp').addEventListener('click', () => { void updateYtDlp(); });
+
   function formatVideoDuration(seconds) {
     const n = Math.max(0, Math.floor(Number(seconds) || 0));
     if (!n) return 'длительность неизвестна';
@@ -2579,20 +2518,7 @@
         '</div></div></article>';
     }).join('');
   }
-  function ytErrorMessage(error) {
-    const message = String(error && error.message ? error.message : error || 'Неизвестная ошибка').trim();
-    const lower = message.toLowerCase();
-    if (/java\.util\.hashmap\.get|hashmap\.get takes 1 argument/.test(lower)) {
-      return 'В приложении обнаружена ошибка параметров yt-dlp. Установи последнюю сборку Crimson.';
-    }
-    if (/http error 403|403 forbidden/.test(lower)) {
-      return message + ' YouTube отклонил запрос аудио (403). Повтори после обновления Crimson; если ошибка останется, импортируй свежий cookies.txt из сеанса YouTube.';
-    }
-    if (/sign in|login required|cookies? required|confirm you.?re not a bot|not a bot|authentication|age.restricted|members.only|private video|captcha|verify you.?re human/.test(lower)) {
-      return message + ' Возможно, YouTube требует входа: импортируй cookies.txt в формате Netscape.';
-    }
-    return message;
-  }
+  const ytErrorMessage = friendlyYoutubeError;
 
   async function searchYoutube(query) {
     const q = String(query || '').replace(/[\r\n]+/g, ' ').trim();
@@ -2619,19 +2545,7 @@
     try {
       const result = await window.CrimsonYtDlp.search({ query: q });
       if (requestId !== state.ytSearchRequestId) return;
-      const uniqueVideos = new Map();
-      for (const item of (Array.isArray(result.results) ? result.results : [])) {
-        if (!item || item.id == null) continue;
-        const id = String(item.id);
-        if (uniqueVideos.has(id)) continue;
-        uniqueVideos.set(id, {
-          ...item,
-          id,
-          title: cleanYouTubeTitle(item.title, id),
-          thumbnail: item.thumbnail || ('https://i.ytimg.com/vi/' + encodeURIComponent(id) + '/hqdefault.jpg')
-        });
-      }
-      state.ytResults = Array.from(uniqueVideos.values());
+      state.ytResults = normalizeYoutubeResults(result.results);
       state.ytSearchCache.set(cacheKey, { at: Date.now(), results: state.ytResults });
       while (state.ytSearchCache.size > 12) state.ytSearchCache.delete(state.ytSearchCache.keys().next().value);
       ytStatus(state.ytResults.length ? 'Найдено: ' + state.ytResults.length + ' • можно слушать или скачать аудио' : 'Ничего не найдено. Попробуй изменить запрос.');
@@ -2655,8 +2569,8 @@
       state.nativeQueueOrder = null;
       state.nativeQueueLastKey = '';
       state.currentRemoteTrack = {
-        id:'youtube:'+video.id, name:info.title || video.title || 'YouTube',
-        artist:info.artist || video.channel || video.uploader || 'YouTube',
+        id:'youtube:'+video.id, name:cleanYouTubeTitle(info.title || video.title || 'YouTube', video.id),
+        artist:cleanArtistName(info.artist || ''),
         duration:Number(info.duration || video.duration)||0, addedAt:Date.now(), size:0, url:info.url, isRemote:true,
         coverUrl: info.thumbnail || video.thumbnail || ('https://i.ytimg.com/vi/' + encodeURIComponent(video.id) + '/hqdefault.jpg')
       };
@@ -2684,7 +2598,7 @@
         id: video.id,
         url: video.url,
         title: video.title || 'YouTube',
-        artist: video.channel || video.uploader || 'YouTube',
+        artist: video.artist || '',
         format: 'original'
       });
       const sourceId = String(video.id);
@@ -2697,12 +2611,13 @@
       const record = {
         id: existing ? existing.id : 'youtube:' + sourceId,
         name: cleanYouTubeTitle(saved.title || video.title || 'YouTube', sourceId),
-        artist: video.channel || video.uploader || 'YouTube',
+        artist: cleanArtistName(saved.artist || video.artist || ''),
         blob: null,
         nativePath: saved.path,
         sourceId: storedSourceId,
         youtubeId: sourceId,
         coverUrl: video.thumbnail || ('https://i.ytimg.com/vi/' + encodeURIComponent(sourceId) + '/hqdefault.jpg'),
+        album: saved.album || '', year: saved.year || '', genre: saved.genre || '',
         coverPath: existing ? (existing.coverPath || '') : '',
         coverBlob: existing ? (existing.coverBlob || null) : null,
         addedAt: existing ? existing.addedAt : Date.now(),
@@ -2735,7 +2650,8 @@
     if (!nativeYtDlp()) { ytStatus('Импорт cookies доступен только в установленном APK.', true); return; }
     try {
       const contents = await file.text();
-      if (!contents.includes('# Netscape HTTP Cookie File') && !contents.includes('# HTTP Cookie File')) throw new Error('Файл не похож на cookies.txt в формате Netscape.');
+      const validation = validateNetscapeCookies(contents);
+      if (!validation.valid) throw new Error(validation.message);
       const result = await window.CrimsonYtDlp.saveCookies({content:contents});
       $('#cookiesStatus').textContent = 'cookies.txt импортирован (' + (result.count || 'готово') + ' строк) для поиска, прослушивания и скачивания в Crimson.';
       ytStatus('Cookies сохранены в приватном каталоге приложения.');
@@ -2761,6 +2677,16 @@
 
   window.addEventListener('crimson-yt-dlp-ready', () => {
     attachDownloadProgressListener();
+    if (typeof window.CrimsonYtDlp?.addListener === 'function') {
+      window.CrimsonYtDlp.addListener('ytDlpUpdate', (event) => {
+        const version = event && event.runtimeVersion ? ' · ' + event.runtimeVersion : '';
+        if (event && event.status === 'CHECKING') ytStatus('Проверяется стабильное обновление yt-dlp…');
+        if (event && event.status === 'DONE') ytStatus('yt-dlp обновлён' + version);
+        else if (event && event.status === 'ALREADY_UP_TO_DATE') ytStatus('yt-dlp уже актуален' + version);
+        else if (event && event.status === 'ERROR') ytStatus('Обновление yt-dlp недоступно; используется установленная версия' + version, true);
+      });
+    }
+
     if (state.db) void refreshFolderSettings();
   });
   attachDownloadProgressListener();

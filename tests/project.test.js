@@ -112,3 +112,43 @@ test('yt-dlp принимает только https-ссылки', () => {
   assert.match(java, /boolean validUrl\(String value\)[^\n]*"https:\/\/"/);
   assert.doesNotMatch(java, /startsWith\("http:\/\/"\)/);
 });
+
+
+test('yt-dlp runtime обновляется именно внутри APK, а версия читается из встроенного runtime', () => {
+  const java = read('native/android/app/src/main/java/com/localify/crimson/YtDlpPlugin.java');
+  assert.match(java, /updateYoutubeDL\(getContext\(\), YoutubeDL\.UpdateChannel\._STABLE\)/);
+  assert.match(java, /YoutubeDL\.getInstance\(\)\.versionName\(getContext\(\)\)/);
+  assert.match(java, /TimeUnit\.DAYS\.toMillis\(7\)/);
+  assert.match(java, /TimeUnit\.HOURS\.toMillis\(24\)/);
+  assert.match(java, /RUNTIME_LAST_ATTEMPT/);
+});
+
+test('скачивание использует альтернативные клиентские стратегии, cookies и проверку аудиофайла', () => {
+  const java = read('native/android/app/src/main/java/com/localify/crimson/YtDlpPlugin.java');
+  assert.match(java, /web_safari/);
+  assert.match(java, /"android"/);
+  assert.match(java, /includeCookies/);
+  assert.match(java, /--embed-metadata/);
+  assert.match(java, /--embed-thumbnail/);
+  assert.match(java, /isPlausibleAudioFile/);
+  assert.match(java, /--audio-quality", "0"/);
+  assert.match(java, /PO Token/);
+});
+
+test('cookies импортируются приватно, валидируются и не пишутся в логи', () => {
+  const java = read('native/android/app/src/main/java/com/localify/crimson/YtDlpPlugin.java');
+  assert.match(java, /validateNetscapeCookies\(content\)/);
+  assert.match(java, /Os\.chmod\(destination\.getAbsolutePath\(\), 0600\)/);
+  assert.match(java, /youtube-cookies\.txt/);
+  assert.match(java, /safeMessage/);
+  assert.doesNotMatch(java, /Log\.[diwe]\(TAG,\s*content/);
+});
+
+test('интерфейс содержит поиск плейлистов, импорт cookies и ручное обновление загрузчика', () => {
+  const html = read('www/index.html');
+  assert.match(html, /id="playlistSearchInput"/);
+  assert.match(html, /id="cookiesPicker"/);
+  assert.match(html, /id="updateYtDlp"/);
+  assert.match(html, /id="importCookies"/);
+  assert.match(html, /id="clearCookies"/);
+});

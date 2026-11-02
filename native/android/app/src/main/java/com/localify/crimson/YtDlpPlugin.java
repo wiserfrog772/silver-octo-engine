@@ -21,6 +21,7 @@ import com.getcapacitor.annotation.ActivityCallback;
 import android.content.ContentValues;
 import android.database.Cursor;
 import android.os.Build;
+import android.util.Log;
 import android.provider.MediaStore;
 import com.yausername.ffmpeg.FFmpeg;
 import com.yausername.youtubedl_android.YoutubeDL;
@@ -32,6 +33,7 @@ import com.yausername.youtubedl_android.mapper.VideoInfo;
 import kotlin.Unit;
 import kotlin.jvm.functions.Function3;
 import org.json.JSONObject;
+import org.json.JSONArray;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.ByteArrayOutputStream;
@@ -39,9 +41,11 @@ import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 @CapacitorPlugin(name = "CrimsonYtDlp")
 public class YtDlpPlugin extends Plugin {
@@ -49,14 +53,99 @@ public class YtDlpPlugin extends Plugin {
     private volatile boolean initialized = false;
     private volatile String initError = "";
     private volatile File cookiesFile;
+    private final Object runtimeUpdateLock = new Object();
+    private static final String TAG = "CrimsonYtDlp";
+    private static final String RUNTIME_PREFS = "crimson_ytdlp_runtime";
+    private static final String RUNTIME_LAST_ATTEMPT = "lastStableUpdateAttempt";
+    private static final String RUNTIME_LAST_FAILED = "lastStableUpdateFailed";
 
     private static final String STORAGE_PREFS = "localify_storage";
     private static final String LIBRARY_TREE_URI = "libraryTreeUri";
     private static final String DOWNLOAD_TREE_URI = "downloadTreeUri";
 
     // The library extracts its Python/yt-dlp and FFmpeg runtime on first real use.
-    // status() deliberately does not call this method so app startup stays lightweight.
+    // Automatic stable-channel checks are throttled, not run on every download.
     private synchronized void ensureReady() throws Exception {
+        if (!initialized) {
+            try {
+                YoutubeDL.getInstance().init(getContext());
+                FFmpeg.getInstance().init(getContext());
+                initialized = true;
+                initError = "";
+            } catch (YoutubeDLException ex) {
+                initError = "Не удалось инициализировать встроенный загрузчик.";
+                Log.e(TAG, "Runtime initialization failed", ex);
+                throw new IllegalStateException(initError + " " + safeMessage(ex), ex);
+            }
+        }
+        maybeUpdateRuntime();
+    }
+
+    private String runtimeVersionName() {
+        if (!initialized) return "";
+        try { return safe(YoutubeDL.getInstance().versionName(getContext())); }
+        catch (Exception ex) {
+            Log.w(TAG, "Unable to read yt-dlp runtime version", ex);
+            return "";
+        }
+    }
+
+    private void maybeUpdateRuntime() {
+        synchronized (runtimeUpdateLock) {
+            android.content.SharedPreferences prefs = getContext().getSharedPreferences(RUNTIME_PREFS, Context.MODE_PRIVATE);
+            long lastAttempt = prefs.getLong(RUNTIME_LAST_ATTEMPT, 0L);
+            boolean lastFailed = prefs.getBoolean(RUNTIME_LAST_FAILED, false);
+            long cooldown = lastFailed ? TimeUnit.HOURS.toMillis(24) : TimeUnit.DAYS.toMillis(7);
+            long now = System.currentTimeMillis();
+            if (lastAttempt > 0L && now - lastAttempt < cooldown) return;
+            prefs.edit().putLong(RUNTIME_LAST_ATTEMPT, now).putBoolean(RUNTIME_LAST_FAILED, true).apply();
+            notifyRuntimeUpdate("CHECKING", runtimeVersionName(), "Проверяется стабильное обновление yt-dlp.");
+            try {
+                Object status = YoutubeDL.getInstance().updateYoutubeDL(getContext(), YoutubeDL.UpdateChannel._STABLE);
+                String state = status == null ? "UNKNOWN" : status.toString().toUpperCase(Locale.ROOT);
+                boolean failed = !isRuntimeUpdateSuccess(state);
+                prefs.edit().putBoolean(RUNTIME_LAST_FAILED, failed).apply();
+                notifyRuntimeUpdate(failed ? "ERROR" : state, runtimeVersionName(), "");
+            } catch (Exception ex) {
+                Log.w(TAG, "Scheduled stable yt-dlp update failed", ex);
+                prefs.edit().putBoolean(RUNTIME_LAST_FAILED, true).apply();
+                notifyRuntimeUpdate("ERROR", runtimeVersionName(), "Обновление не удалось; используется текущая версия.");
+            }
+        }
+    }
+
+    private boolean isRuntimeUpdateSuccess(String state) {
+        return "DONE".equals(state) || "ALREADY_UP_TO_DATE".equals(state);
+    }
+
+    private void notifyRuntimeUpdate(String status, String version, String message) {
+        JSObject event = new JSObject();
+        event.put("status", status);
+        event.put("runtimeVersion", version == null ? "" : version);
+        if (message != null && !message.isEmpty()) event.put("message", message);
+        notifyListeners("ytDlpUpdate", event);
+    }
+
+    private JSObject updateStableRuntimeNow() throws Exception {
+        ensureRuntimeInitializedOnly();
+        synchronized (runtimeUpdateLock) {
+            android.content.SharedPreferences prefs = getContext().getSharedPreferences(RUNTIME_PREFS, Context.MODE_PRIVATE);
+            prefs.edit().putLong(RUNTIME_LAST_ATTEMPT, System.currentTimeMillis()).putBoolean(RUNTIME_LAST_FAILED, true).apply();
+            notifyRuntimeUpdate("CHECKING", runtimeVersionName(), "Проверяется стабильное обновление yt-dlp.");
+            Object status = YoutubeDL.getInstance().updateYoutubeDL(getContext(), YoutubeDL.UpdateChannel._STABLE);
+            String state = status == null ? "UNKNOWN" : status.toString().toUpperCase(Locale.ROOT);
+            boolean failed = !isRuntimeUpdateSuccess(state);
+            prefs.edit().putBoolean(RUNTIME_LAST_FAILED, failed).apply();
+            String version = runtimeVersionName();
+            notifyRuntimeUpdate(failed ? "ERROR" : state, version, "");
+            JSObject result = new JSObject();
+            result.put("status", failed ? "ERROR" : state);
+            result.put("runtimeVersion", version);
+            return result;
+        }
+    }
+
+    private synchronized void ensureRuntimeInitializedOnly() throws Exception {
         if (initialized) return;
         try {
             YoutubeDL.getInstance().init(getContext());
@@ -64,8 +153,8 @@ public class YtDlpPlugin extends Plugin {
             initialized = true;
             initError = "";
         } catch (YoutubeDLException ex) {
-            initError = "Не удалось инициализировать youtubedl-android: " + ex.getMessage();
-            throw new IllegalStateException(initError, ex);
+            Log.e(TAG, "Runtime initialization failed before explicit update", ex);
+            throw new IllegalStateException("Не удалось инициализировать встроенный загрузчик.", ex);
         }
     }
 
@@ -334,45 +423,29 @@ public class YtDlpPlugin extends Plugin {
         return target;
     }
 
-    private void exportToSelectedDownloadFolder(File source) throws Exception {
-        String treeText = storagePrefs().getString(DOWNLOAD_TREE_URI, "");
-        if (treeText == null || treeText.isEmpty()) return;
-        DocumentFile directory = DocumentFile.fromTreeUri(getContext(), Uri.parse(treeText));
-        if (directory == null || !directory.isDirectory()) {
-            throw new IllegalStateException("Папка загрузок недоступна. Выбери её заново в настройках.");
-        }
-        DocumentFile existing = directory.findFile(source.getName());
-        if (existing != null && existing.isFile() && !existing.delete()) {
-            throw new IllegalStateException("Не удалось заменить файл в выбранной папке: " + source.getName());
-        }
-        String extension = "";
-        int dot = source.getName().lastIndexOf('.');
-        if (dot >= 0 && dot < source.getName().length() - 1) extension = source.getName().substring(dot + 1);
-        String mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.toLowerCase(Locale.ROOT));
-        if (mime == null) mime = "audio/*";
-        DocumentFile destination = directory.createFile(mime, source.getName());
-        if (destination == null) throw new IllegalStateException("Android не смог создать файл в выбранной папке.");
-        try (java.io.InputStream input = new java.io.FileInputStream(source);
-             java.io.OutputStream output = getContext().getContentResolver().openOutputStream(destination.getUri(), "w")) {
-            if (output == null) throw new IllegalStateException("Папка не разрешает запись.");
-            byte[] buffer = new byte[64 * 1024];
-            int count;
-            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
-            output.flush();
-        }
-    }
-
-
     @PluginMethod
     public void status(PluginCall call) {
-        // This is intentionally non-initializing. The first search, stream or
-        // download action triggers runtime extraction in ensureReady().
+        // Non-initializing: the first real yt-dlp action extracts the bundled runtime.
         JSObject result = new JSObject();
-        result.put("version", "0.18.1");
+        result.put("version", "0.18.1"); // Wrapper version, not the embedded yt-dlp version.
+        result.put("runtimeVersion", runtimeVersionName());
         result.put("hasCookies", getCookiesFile() != null);
         result.put("initialized", initialized);
         call.resolve(result);
     }
+
+    @PluginMethod
+    public void updateYtDlp(PluginCall call) {
+        executor.execute(() -> {
+            try {
+                call.resolve(updateStableRuntimeNow());
+            } catch (Exception ex) {
+                Log.e(TAG, "Manual stable yt-dlp update failed", ex);
+                call.reject("Не удалось обновить встроенный yt-dlp. Проверь подключение к интернету.");
+            }
+        });
+    }
+
 
     @PluginMethod
     public void search(PluginCall call) {
@@ -443,22 +516,92 @@ public class YtDlpPlugin extends Plugin {
     }
 
     private String cleanYouTubeTitle(String rawTitle, String videoId) {
-        String title = fallback(rawTitle, "YouTube").trim();
+        String title = safe(rawTitle);
         String id = safe(videoId);
-        // Some search results/older downloads include yt-dlp's customary [video-id] suffix.
-        // Strip it only when it matches this exact source ID, so real bracketed titles survive.
+        if (title.isEmpty()) return "";
         if (id.matches("[A-Za-z0-9_-]{11}")) {
-            String[] suffixes = new String[] { "[" + id + "]", "(" + id + ")" };
-            for (String suffix : suffixes) {
-                if (title.length() >= suffix.length() &&
-                    title.regionMatches(true, title.length() - suffix.length(), suffix, 0, suffix.length())) {
-                    title = title.substring(0, title.length() - suffix.length()).trim();
-                    break;
+            title = title.replaceFirst("(?i)\\s*[\\[(]" + java.util.regex.Pattern.quote(id) + "[)\\]]\\s*$", "");
+        }
+        title = title.replaceAll("(?i)\\s*[\\[(](?:official(?:\\s+music)?\\s+(?:video|audio)|music\\s+video|lyric(?:s)?(?:\\s+video)?|visualizer|audio\\s*hq|full\\s*hd|ultra\\s*hd|4k|2160p|1440p|1080p|720p|480p|hd)[)\\]]", " ");
+        title = title.replaceAll("(?i)(?:\\s*[|•·]\\s*)?(?:official(?:\\s+music)?\\s+(?:video|audio)|music\\s+video|lyric(?:s)?(?:\\s+video)?|visualizer|audio\\s*hq|full\\s*hd|ultra\\s*hd|4k|2160p|1440p|1080p|720p|480p|hd)\\s*$", "");
+        title = title.replaceAll("[\\s|•·-]+$", "").replaceAll("^[\\s|•·]+", "");
+        title = title.replaceAll("\\s{2,}", " ").replaceAll("\\s+([,.;!?])", "$1").trim();
+        return title;
+    }
+
+    private String cleanArtistName(String rawArtist) {
+        String artist = safe(rawArtist);
+        if (artist.isEmpty()) return "";
+        artist = artist.replaceAll("(?i)\\s*[-–—|•·]\\s*Topic\\s*$", "");
+        artist = artist.replaceAll("(?i)\\s*[\\[(]\\s*(?:Official(?:\\s+Artist)?(?:\\s+Channel)?|VEVO)\\s*[\\])]\\s*$", "");
+        artist = artist.replaceAll("(?i)(?:\\s*[-–—|•·]\\s*)?(?:Official(?:\\s+Artist)?(?:\\s+Channel)?|VEVO)\\s*$", "");
+        artist = artist.replaceAll("(?i)\\.VEVO\\s*$", "").replaceAll("\\s*[-–—|•·]+\\s*$", "").trim();
+        if (artist.isEmpty()) return "";
+        List<String> unique = new ArrayList<>();
+        for (String part : artist.split("\\s*[,;]\\s*")) {
+            String name = part.trim();
+            boolean duplicate = false;
+            for (String existing : unique) if (existing.equalsIgnoreCase(name)) { duplicate = true; break; }
+            if (!name.isEmpty() && !duplicate) unique.add(name);
+        }
+        return android.text.TextUtils.join(", ", unique);
+    }
+
+    private String firstMetadataValue(JSONObject metadata, String... keys) {
+        if (metadata == null) return "";
+        for (String key : keys) {
+            Object value = metadata.opt(key);
+            if (value instanceof JSONArray) {
+                JSONArray array = (JSONArray) value;
+                List<String> values = new ArrayList<>();
+                for (int i = 0; i < array.length(); i++) {
+                    String item = safe(array.optString(i, ""));
+                    if (!item.isEmpty() && !values.contains(item)) values.add(item);
                 }
+                if (!values.isEmpty()) return android.text.TextUtils.join(", ", values);
+            } else if (value != null && value != JSONObject.NULL) {
+                String text = safe(String.valueOf(value));
+                if (!text.isEmpty() && !"null".equalsIgnoreCase(text)) return text;
             }
         }
-        return title.isEmpty() ? "YouTube" : title;
+        return "";
     }
+
+    private JSONObject readTrackMetadata(String url) {
+        try {
+            YoutubeDLRequest request = baseRequest(url)
+                .addOption("--no-playlist")
+                .addOption("--skip-download")
+                .addOption("--dump-single-json");
+            YoutubeDLResponse response = YoutubeDL.getInstance().execute(request, "crimson-metadata-" + System.nanoTime(), null);
+            String output = response.getOut();
+            if (output == null) return new JSONObject();
+            int first = output.indexOf('{');
+            int last = output.lastIndexOf('}');
+            if (first < 0 || last <= first) return new JSONObject();
+            return new JSONObject(output.substring(first, last + 1));
+        } catch (Exception ex) {
+            Log.w(TAG, "Optional structured metadata lookup failed", ex);
+            return new JSONObject();
+        }
+    }
+
+    private String releaseYear(JSONObject metadata) {
+        String date = firstMetadataValue(metadata, "release_date", "upload_date", "release_year");
+        if (date.length() >= 4 && date.substring(0, 4).matches("\\d{4}")) {
+            int year = Integer.parseInt(date.substring(0, 4));
+            if (year >= 1880 && year <= java.util.Calendar.getInstance().get(java.util.Calendar.YEAR) + 1) return date.substring(0, 4);
+        }
+        long timestamp = metadata == null ? 0L : metadata.optLong("release_timestamp", 0L);
+        if (timestamp > 0L) {
+            java.util.Calendar calendar = java.util.Calendar.getInstance();
+            calendar.setTimeInMillis(timestamp > 100000000000L ? timestamp : timestamp * 1000L);
+            int year = calendar.get(java.util.Calendar.YEAR);
+            if (year >= 1880 && year <= java.util.Calendar.getInstance().get(java.util.Calendar.YEAR) + 1) return String.valueOf(year);
+        }
+        return "";
+    }
+
 
     private String readThumbnail(JSONObject item) {
         String direct = item.optString("thumbnail", "");
@@ -484,18 +627,21 @@ public class YtDlpPlugin extends Plugin {
         executor.execute(() -> {
             try {
                 ensureReady();
-                YoutubeDLRequest request = baseRequest(url)
-                    .addOption("--no-playlist")
-                    .addOption("-f", "bestaudio[acodec*=opus]/bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best");
-                VideoInfo info = YoutubeDL.getInstance().getInfo(request);
+                VideoInfo info = getStreamInfoWithFallback(url);
                 String streamUrl = fallback(info.getUrl(), selectAudioUrl(info));
-                if (streamUrl.isEmpty()) {
-                    throw new IllegalStateException("yt-dlp не вернул прямой аудиопоток.");
-                }
+                if (streamUrl.isEmpty()) throw new IllegalStateException("Не удалось получить прямой аудиопоток.");
+                JSONObject metadata = readTrackMetadata(url);
+                String title = cleanYouTubeTitle(firstMetadataValue(metadata, "track", "title"), "");
+                if (title.isEmpty()) title = cleanYouTubeTitle(info.getTitle(), "");
+                String artist = cleanArtistName(firstMetadataValue(metadata, "artists", "artist", "album_artists", "album_artist", "creator", "uploader", "channel"));
+                if (artist.isEmpty()) artist = cleanArtistName(info.getUploader());
                 JSObject result = new JSObject();
                 result.put("url", streamUrl);
-                result.put("title", fallback(info.getTitle(), "YouTube"));
-                result.put("artist", fallback(info.getUploader(), "YouTube"));
+                result.put("title", fallback(title, "Без названия"));
+                result.put("artist", artist);
+                result.put("album", firstMetadataValue(metadata, "album"));
+                result.put("year", releaseYear(metadata));
+                result.put("genre", firstMetadataValue(metadata, "genre", "genres", "categories"));
                 result.put("duration", info.getDuration());
                 result.put("thumbnail", fallback(info.getThumbnail(), readThumbnailFromInfo(info)));
                 call.resolve(result);
@@ -503,6 +649,34 @@ public class YtDlpPlugin extends Plugin {
                 call.reject(safeMessage(ex));
             }
         });
+    }
+
+
+    private VideoInfo getStreamInfoWithFallback(String url) throws Exception {
+        boolean hasCookies = getCookiesFile() != null;
+        List<String[]> clients = new ArrayList<>();
+        clients.add(new String[] {"default", "true"});
+        if (hasCookies) clients.add(new String[] {"default", "false"});
+        clients.add(new String[] {"web_safari", "true"});
+        if (hasCookies) clients.add(new String[] {"web_safari", "false"});
+        clients.add(new String[] {"android", "true"});
+        if (hasCookies) clients.add(new String[] {"android", "false"});
+        Exception lastError = null;
+        for (String[] candidate : clients) {
+            try {
+                String client = "default".equals(candidate[0]) ? "" : candidate[0];
+                YoutubeDLRequest request = baseRequest(url, Boolean.parseBoolean(candidate[1]), client)
+                    .addOption("--no-playlist")
+                    .addOption("-f", "bestaudio[acodec*=opus]/bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio");
+                VideoInfo info = YoutubeDL.getInstance().getInfo(request);
+                if (info != null && (!safe(info.getUrl()).isEmpty() || !selectAudioUrl(info).isEmpty())) return info;
+                lastError = new IllegalStateException("Extractor returned no direct audio URL for client " + candidate[0]);
+            } catch (Exception ex) {
+                lastError = ex;
+                Log.w(TAG, "Audio stream info failed for client " + candidate[0] + " (cookies=" + candidate[1] + ")", ex);
+            }
+        }
+        throw new IllegalStateException(lastError == null ? "Не удалось получить аудиопоток." : safeMessage(lastError), lastError);
     }
 
     private String readThumbnailFromInfo(VideoInfo info) {
@@ -519,7 +693,8 @@ public class YtDlpPlugin extends Plugin {
     public void downloadAudio(PluginCall call) {
         String url = safe(call.getString("url"));
         String id = cleanFilePart(safe(call.getString("id")));
-        String title = cleanYouTubeTitle(fallback(safe(call.getString("title")), "YouTube"), id);
+        String requestedTitle = safe(call.getString("title"));
+        String requestedArtist = cleanArtistName(safe(call.getString("artist")));
         String requestedFormat = safe(call.getString("format"));
         if (!validUrl(url) || id.isEmpty()) {
             call.reject("Недостаточно данных для скачивания.");
@@ -530,35 +705,50 @@ public class YtDlpPlugin extends Plugin {
             try {
                 ensureReady();
                 File outputDir = musicOutputDirectory();
+                JSONObject metadata = readTrackMetadata(url);
+                String title = cleanYouTubeTitle(firstMetadataValue(metadata, "track", "title"), "");
+                if (title.isEmpty()) title = cleanYouTubeTitle(requestedTitle, id);
+                if (title.isEmpty()) title = "Без названия";
+                String artist = cleanArtistName(firstMetadataValue(metadata, "artists", "artist", "album_artists", "album_artist", "creator", "uploader", "channel"));
+                if (artist.isEmpty()) artist = requestedArtist;
+                String album = cleanYouTubeTitle(firstMetadataValue(metadata, "album"), "");
+                String year = releaseYear(metadata);
+                String genre = firstMetadataValue(metadata, "genre", "genres", "categories");
+                boolean hasCookies = getCookiesFile() != null;
 
-                // Keep auto mode strictly audio-only. "best" is a combined audio+video
-                // format on YouTube and was the reason an MP4 video could be saved here.
-                // yt-dlp's bestaudio selects the best available audio codec (normally Opus/M4A).
-                // If no audio-only format can be downloaded, the final attempt extracts MP3
-                // from bestaudio/best using FFmpeg, so the result is still audio-only.
-                final String[] labels;
-                final String[] outputKeys;
-                final String[] selectors;
-                final boolean[] transcode;
+                // Start with yt-dlp's normal client negotiation; retry with cookies disabled
+                // when an imported session conflicts, then try a different supported client.
+                final String[][] strategies;
                 if ("mp3".equalsIgnoreCase(requestedFormat)) {
-                    labels = new String[] { "MP3" };
-                    outputKeys = new String[] { id + "-mp3-v2" };
-                    selectors = new String[] { "bestaudio/best" };
-                    transcode = new boolean[] { true };
+                    List<String[]> attempts = new ArrayList<>();
+                    attempts.add(new String[] {"MP3 · стандартный клиент", "mp3-default-v3", "bestaudio/best", "true", "true", ""});
+                    if (hasCookies) attempts.add(new String[] {"MP3 · без cookies", "mp3-anonymous-v3", "bestaudio/best", "true", "false", ""});
+                    attempts.add(new String[] {"MP3 · резервный клиент", "mp3-safari-v3", "bestaudio/best", "true", "true", "web_safari"});
+                    if (hasCookies) attempts.add(new String[] {"MP3 · резервный клиент без cookies", "mp3-safari-anonymous-v3", "bestaudio/best", "true", "false", "web_safari"});
+                    strategies = attempts.toArray(new String[0][]);
                 } else {
-                    labels = new String[] { "Исходный аудиоформат", "MP3" };
-                    outputKeys = new String[] { id + "-audio-v2", id + "-fallback-mp3-v2" };
-                    selectors = new String[] { "bestaudio", "bestaudio/best" };
-                    transcode = new boolean[] { false, true };
+                    List<String[]> attempts = new ArrayList<>();
+                    attempts.add(new String[] {"Исходный формат · стандартный клиент", "audio-default-v3", "bestaudio", "false", "true", ""});
+                    if (hasCookies) attempts.add(new String[] {"Исходный формат · без cookies", "audio-anonymous-v3", "bestaudio", "false", "false", ""});
+                    attempts.add(new String[] {"Исходный формат · резервный клиент", "audio-safari-v3", "bestaudio", "false", "true", "web_safari"});
+                    attempts.add(new String[] {"MP3 · стандартный клиент", "audio-mp3-v3", "bestaudio/best", "true", "true", ""});
+                    attempts.add(new String[] {"MP3 · резервный клиент", "audio-mp3-safari-v3", "bestaudio/best", "true", "true", "web_safari"});
+                    if (hasCookies) attempts.add(new String[] {"MP3 · резервный клиент без cookies", "audio-mp3-safari-anonymous-v3", "bestaudio/best", "true", "false", "web_safari"});
+                    strategies = attempts.toArray(new String[0][]);
                 }
 
                 StringBuilder failures = new StringBuilder();
-                for (int attempt = 0; attempt < labels.length; attempt++) {
-                    String label = labels[attempt];
-                    String outputKey = outputKeys[attempt];
-                    File file = findDownloadedFile(outputDir, outputKey);
-
-                    if (file == null) {
+                File downloaded = null;
+                String finalFormatLabel = "";
+                for (int attempt = 0; attempt < strategies.length; attempt++) {
+                    String[] strategy = strategies[attempt];
+                    String label = strategy[0];
+                    String outputKey = id + "-" + strategy[1];
+                    boolean transcode = Boolean.parseBoolean(strategy[3]);
+                    boolean includeCookies = Boolean.parseBoolean(strategy[4]);
+                    String playerClient = strategy[5];
+                    File candidate = findDownloadedFile(outputDir, outputKey);
+                    if (candidate == null) {
                         JSObject attemptUpdate = new JSObject();
                         attemptUpdate.put("id", id);
                         attemptUpdate.put("progress", 0);
@@ -566,25 +756,25 @@ public class YtDlpPlugin extends Plugin {
                         attemptUpdate.put("format", label);
                         notifyListeners("downloadProgress", attemptUpdate);
                         try {
-                            YoutubeDLRequest request = baseRequest(url)
+                            YoutubeDLRequest request = baseRequest(url, includeCookies, playerClient)
                                 .addOption("--no-playlist")
                                 .addOption("--no-mtime")
                                 .addOption("--newline")
                                 .addOption("--retries", "3")
                                 .addOption("--extractor-retries", "3")
                                 .addOption("--fragment-retries", "3")
-                                .addOption("-f", selectors[attempt])
+                                .addOption("-f", strategy[2])
+                                .addOption("--parse-metadata", "%(track,title)s:^(?P<meta_title>.+?)(?:\\s*(?:[-–—|•·]\\s*)?[\\[(]?(?:official(?:\\s+music)?\\s+(?:video|audio)|music\\s+video|lyric(?:s)?(?:\\s+video)?|visualizer|audio\\s*hq|full\\s*hd|ultra\\s*hd|4k|2160p|1440p|1080p|720p|480p|hd)[\\])]?)+$")
+                                .addOption("--parse-metadata", "%(artist,artists,creator,creators,uploader,uploader_id)s:^(?P<meta_artist>.+?)(?:\\s*(?:[-–—|•·]\\s*)?(?:official(?:\\s+artist)?(?:\\s+channel)?|vevo|topic))+$")
+                                .addOption("--embed-metadata")
+                                .addOption("--embed-thumbnail")
                                 .addOption("-o", new File(outputDir, outputKey + ".%(ext)s").getAbsolutePath());
-
-                            if (transcode[attempt]) {
+                            if (transcode) {
                                 request.addOption("-x")
                                     .addOption("--audio-format", "mp3")
-                                    .addOption("--audio-quality", "192K")
-                                    .addOption("--embed-metadata");
+                                    .addOption("--audio-quality", "0");
                             }
-
-                            String processId = "crimson-download-" + id + "-" + label.toLowerCase(Locale.ROOT)
-                                + "-" + System.nanoTime();
+                            String processId = "crimson-download-" + id + "-" + strategy[1] + "-" + System.nanoTime();
                             Function3<Float, Long, String, Unit> callback = new Function3<Float, Long, String, Unit>() {
                                 @Override
                                 public Unit invoke(Float progress, Long etaInSeconds, String line) {
@@ -597,23 +787,20 @@ public class YtDlpPlugin extends Plugin {
                                     return Unit.INSTANCE;
                                 }
                             };
-
                             YoutubeDLResponse response = YoutubeDL.getInstance().execute(request, processId, callback);
                             if (response.getExitCode() != 0) {
-                                throw new IllegalStateException("код " + response.getExitCode() + ": " + response.getErr());
+                                String diagnostic = fallback(response.getErr(), response.getOut());
+                                throw new IllegalStateException("yt-dlp exit " + response.getExitCode() + ": " + diagnostic);
                             }
-                            file = findDownloadedFile(outputDir, outputKey);
-                            if (file == null) {
-                                throw new IllegalStateException("yt-dlp завершился, но файл не найден.");
-                            }
+                            candidate = findDownloadedFile(outputDir, outputKey);
+                            if (candidate == null) throw new IllegalStateException("Download completed but no valid audio file was produced.");
                         } catch (Exception attemptError) {
+                            Log.e(TAG, "Download attempt failed [" + label + "]", attemptError);
                             cleanupDownloadAttempt(outputDir, outputKey);
                             if (failures.length() > 0) failures.append(" | ");
                             failures.append(label).append(": ").append(safeMessage(attemptError));
-                            String reason = safeMessage(attemptError).replaceAll("\\s+", " ").trim();
-                            if (reason.length() > 150) reason = reason.substring(0, 147) + "...";
-                            String message = label + " не удалось: " + reason;
-                            if (attempt + 1 < labels.length) message += ". Пробую " + labels[attempt + 1] + "…";
+                            String message = friendlyDownloadFailure(failures.toString());
+                            if (attempt + 1 < strategies.length) message += " Пробую альтернативный способ…";
                             JSObject fallbackUpdate = new JSObject();
                             fallbackUpdate.put("id", id);
                             fallbackUpdate.put("progress", 0);
@@ -624,27 +811,78 @@ public class YtDlpPlugin extends Plugin {
                             continue;
                         }
                     }
-
-                    // Publishing is deliberately outside the format-specific catch:
-                    // a storage permission error must not trigger another download.
-                    publishDownload(file, title, id);
-                    JSObject result = new JSObject();
-                    result.put("path", file.getAbsolutePath());
-                    result.put("title", title);
-                    result.put("size", file.length());
-                    result.put("format", actualAudioFormat(file, label));
-                    call.resolve(result);
-                    return;
+                    if (candidate == null || !candidate.isFile() || candidate.length() < 256 || !isPlausibleAudioFile(candidate)) {
+                        cleanupDownloadAttempt(outputDir, outputKey);
+                        if (failures.length() > 0) failures.append(" | ");
+                        failures.append(label).append(": файл пустой или повреждён");
+                        continue;
+                    }
+                    downloaded = candidate;
+                    finalFormatLabel = label;
+                    break;
                 }
 
-                String prefix = "mp3".equalsIgnoreCase(requestedFormat)
-                    ? "Не удалось скачать аудио в MP3. "
-                    : "Не удалось скачать аудио в исходном формате или MP3. ";
-                throw new IllegalStateException(prefix + failures);
+                if (downloaded == null) {
+                    Log.e(TAG, "All download strategies failed for video " + id + ": " + failures);
+                    throw new IllegalStateException(friendlyDownloadFailure(failures.toString()));
+                }
+                publishDownload(downloaded, artist, title, id);
+                JSObject result = new JSObject();
+                result.put("path", downloaded.getAbsolutePath());
+                result.put("title", title);
+                result.put("artist", artist);
+                result.put("album", album);
+                result.put("year", year);
+                result.put("genre", genre);
+                result.put("size", downloaded.length());
+                result.put("format", actualAudioFormat(downloaded, finalFormatLabel));
+                call.resolve(result);
             } catch (Exception ex) {
-                call.reject("Ошибка yt-dlp: " + safeMessage(ex));
+                Log.e(TAG, "Audio download failed", ex);
+                String message = safeMessage(ex);
+                if (message.startsWith("YouTube отклонил") || message.startsWith("Не удалось обработать") || message.startsWith("Не удалось скачать") || message.startsWith("Файл cookies")) call.reject(message);
+                else call.reject(friendlyDownloadFailure(message));
             }
         });
+    }
+
+    private String friendlyDownloadFailure(String diagnostic) {
+        String lower = safe(diagnostic).toLowerCase(Locale.ROOT);
+        if (lower.contains("http error 403") || lower.contains("403 forbidden") || lower.contains("forbidden")) {
+            return "YouTube отклонил запрос на аудиопоток (HTTP 403). Проверь подключение и обновление yt-dlp. Иногда YouTube требует PO Token; cookies не всегда устраняют эту причину.";
+        }
+        if (lower.contains("cookie") || lower.contains("sign in") || lower.contains("login required") || lower.contains("not a bot") || lower.contains("captcha")) {
+            return "Файл cookies недействителен или устарел либо YouTube требует авторизацию. Импортируй свежий cookies.txt из своего сеанса YouTube.";
+        }
+        if (lower.contains("ffmpeg") || lower.contains("postprocess") || lower.contains("audio-convert") || lower.contains("conversion")) {
+            return "Не удалось преобразовать аудио в MP3. Проверь наличие и работоспособность FFmpeg.";
+        }
+        if (lower.contains("requested format is not available") || lower.contains("no video formats") || lower.contains("no valid audio")) {
+            return "Не удалось получить аудиопоток. Попробуй проверить или обновить yt-dlp.";
+        }
+        if (lower.contains("timeout") || lower.contains("network") || lower.contains("connection") || lower.contains("unable to download") || lower.contains("temporary failure")) {
+            return "Не удалось скачать трек из-за сетевой ошибки. Проверь подключение и попробуй ещё раз.";
+        }
+        return "Не удалось скачать трек. Попробуй ещё раз; подробности сохранены в журнале Crimson.";
+    }
+
+    private boolean isPlausibleAudioFile(File file) {
+        String name = file.getName().toLowerCase(Locale.ROOT);
+        String extension = name.contains(".") ? name.substring(name.lastIndexOf('.') + 1) : "";
+        if (!("mp3".equals(extension) || "m4a".equals(extension) || "mp4".equals(extension) || "opus".equals(extension) ||
+            "webm".equals(extension) || "ogg".equals(extension) || "oga".equals(extension) || "aac".equals(extension) ||
+            "flac".equals(extension) || "wav".equals(extension))) return false;
+        byte[] header = new byte[12];
+        try (java.io.InputStream input = new java.io.FileInputStream(file)) { if (input.read(header) < 4) return false; }
+        catch (Exception ex) { return false; }
+        if ("mp3".equals(extension)) return (header[0] == 'I' && header[1] == 'D' && header[2] == '3') || ((header[0] & 0xff) == 0xff && (header[1] & 0xe0) == 0xe0);
+        if ("m4a".equals(extension) || "mp4".equals(extension)) return header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p';
+        if ("ogg".equals(extension) || "oga".equals(extension) || "opus".equals(extension)) return header[0] == 'O' && header[1] == 'g' && header[2] == 'g' && header[3] == 'S';
+        if ("webm".equals(extension)) return (header[0] & 0xff) == 0x1a && (header[1] & 0xff) == 0x45 && (header[2] & 0xff) == 0xdf && (header[3] & 0xff) == 0xa3;
+        if ("flac".equals(extension)) return header[0] == 'f' && header[1] == 'L' && header[2] == 'a' && header[3] == 'C';
+        if ("wav".equals(extension)) return header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F';
+        if ("aac".equals(extension)) return (header[0] & 0xff) == 0xff && (header[1] & 0xf6) == 0xf0;
+        return false;
     }
 
     private void cleanupDownloadAttempt(File outputDir, String outputKey) {
@@ -662,22 +900,78 @@ public class YtDlpPlugin extends Plugin {
     @PluginMethod
     public void saveCookies(PluginCall call) {
         String content = call.getString("content");
-        if (content == null || content.trim().isEmpty()) { call.reject("Файл cookies.txt пуст."); return; }
-        if (!content.contains("\t") || (!content.contains("# Netscape HTTP Cookie File") && !content.contains("# HTTP Cookie File"))) {
-            call.reject("Ожидается файл cookies.txt в формате Netscape.");
-            return;
-        }
+        CookieValidation validation = validateNetscapeCookies(content);
+        if (!validation.valid) { call.reject(validation.message); return; }
         executor.execute(() -> {
+            File temporary = null;
+            File backup = null;
+            File destination = null;
             try {
-                File out = new File(getContext().getFilesDir(), "youtube-cookies.txt");
-                try (Writer writer = new OutputStreamWriter(new FileOutputStream(out, false), StandardCharsets.UTF_8)) { writer.write(content); }
-                cookiesFile = out;
+                File directory = getContext().getFilesDir();
+                destination = new File(directory, "youtube-cookies.txt");
+                temporary = new File(directory, "youtube-cookies.txt." + System.nanoTime() + ".tmp");
+                backup = new File(directory, "youtube-cookies.txt.backup");
+                try (Writer writer = new OutputStreamWriter(new FileOutputStream(temporary, false), StandardCharsets.UTF_8)) {
+                    writer.write(content.replace("\r\n", "\n"));
+                    writer.flush();
+                }
+                try { android.system.Os.chmod(temporary.getAbsolutePath(), 0600); } catch (Exception ignored) {}
+                if (backup.exists() && !backup.delete()) throw new IllegalStateException("Unable to clear cookies backup");
+                boolean backedUp = destination.exists();
+                if (backedUp && !destination.renameTo(backup)) throw new IllegalStateException("Unable to preserve previous cookies file");
+                if (!temporary.renameTo(destination)) {
+                    if (backedUp) backup.renameTo(destination);
+                    throw new IllegalStateException("Unable to atomically replace cookies file");
+                }
+                try { android.system.Os.chmod(destination.getAbsolutePath(), 0600); } catch (Exception ignored) {}
+                if (backup.exists()) backup.delete();
+                cookiesFile = destination;
                 JSObject result = new JSObject();
-                result.put("count", content.split("\\R").length);
+                result.put("count", validation.count);
                 result.put("hasCookies", true);
                 call.resolve(result);
-            } catch (Exception ex) { call.reject("Не удалось сохранить cookies.txt: " + safeMessage(ex)); }
+            } catch (Exception ex) {
+                Log.e(TAG, "Unable to save imported cookies file", ex);
+                if (temporary != null && temporary.exists()) temporary.delete();
+                if (backup != null && backup.exists() && destination != null && !destination.exists()) backup.renameTo(destination);
+                call.reject("Не удалось безопасно сохранить cookies.txt. Проверь свободное место и повтори импорт.");
+            }
         });
+    }
+
+    private static class CookieValidation {
+        final boolean valid;
+        final int count;
+        final String message;
+        CookieValidation(boolean valid, int count, String message) { this.valid = valid; this.count = count; this.message = message; }
+    }
+
+    private CookieValidation validateNetscapeCookies(String content) {
+        String text = content == null ? "" : content.replace("\uFEFF", "").trim();
+        if (text.isEmpty()) return new CookieValidation(false, 0, "Файл cookies.txt пуст.");
+        String[] lines = text.split("\\r?\\n");
+        boolean header = false;
+        int validRows = 0;
+        int activeYoutubeRows = 0;
+        long now = System.currentTimeMillis() / 1000L;
+        for (String line : lines) {
+            if (line.matches("(?i)^#\\s*(?:Netscape(?: HTTP)?|HTTP) Cookie File.*$")) header = true;
+            String row = line.startsWith("#HttpOnly_") ? line.substring("#HttpOnly_".length()) : line;
+            if (row.isEmpty() || row.startsWith("#")) continue;
+            String[] fields = row.split("\\t", -1);
+            if (fields.length != 7 || fields[0].trim().isEmpty() || !("TRUE".equalsIgnoreCase(fields[1]) || "FALSE".equalsIgnoreCase(fields[1])) ||
+                !fields[2].startsWith("/") || !("TRUE".equalsIgnoreCase(fields[3]) || "FALSE".equalsIgnoreCase(fields[3])) ||
+                !fields[4].matches("\\d+") || fields[5].isEmpty()) continue;
+            validRows++;
+            String domain = fields[0].toLowerCase(Locale.ROOT);
+            long expires;
+            try { expires = Long.parseLong(fields[4]); } catch (Exception ignored) { continue; }
+            if (("youtube.com".equals(domain) || domain.endsWith(".youtube.com")) && (expires == 0L || expires > now)) activeYoutubeRows++;
+        }
+        if (!header) return new CookieValidation(false, validRows, "Ожидается cookies.txt в формате Netscape.");
+        if (validRows == 0) return new CookieValidation(false, 0, "В файле не найдено корректных строк cookies в формате Netscape.");
+        if (activeYoutubeRows == 0) return new CookieValidation(false, validRows, "В файле нет действующих cookies для YouTube. Экспортируй свежий cookies.txt.");
+        return new CookieValidation(true, validRows, "");
     }
 
     @PluginMethod
@@ -685,27 +979,32 @@ public class YtDlpPlugin extends Plugin {
         executor.execute(() -> {
             try {
                 File file = getCookiesFile();
-                if (file != null && file.exists() && !file.delete()) throw new IllegalStateException("Не удалось удалить файл cookies.");
+                if (file != null && file.exists() && !file.delete()) throw new IllegalStateException("Unable to delete cookies file");
                 cookiesFile = null;
                 call.resolve();
-            } catch (Exception ex) { call.reject(safeMessage(ex)); }
+            } catch (Exception ex) {
+                Log.e(TAG, "Unable to remove cookies file", ex);
+                call.reject("Не удалось удалить cookies.txt из приватного хранилища приложения.");
+            }
         });
     }
 
+
     private YoutubeDLRequest baseRequest(String url) {
+        return baseRequest(url, true, "");
+    }
+
+    private YoutubeDLRequest baseRequest(String url, boolean includeCookies, String playerClient) {
         YoutubeDLRequest request = new YoutubeDLRequest(url)
             .addOption("--quiet")
-            // YouTube may require a JavaScript challenge solver before audio formats are exposed.
             .addOption("--js-runtimes", "quickjs")
             .addOption("--remote-components", "ejs:github")
-            // Keep yt-dlp warnings visible; they explain missing formats and challenge failures.
             .addOption("--socket-timeout", "30")
             .addOption("--retries", "3")
             .addOption("--extractor-retries", "3");
-        File cookieFile = getCookiesFile();
-        if (cookieFile != null) {
-            request.addOption("--cookies", cookieFile.getAbsolutePath());
-        }
+        File cookieFile = includeCookies ? getCookiesFile() : null;
+        if (cookieFile != null && cookieFile.isFile()) request.addOption("--cookies", cookieFile.getAbsolutePath());
+        if (playerClient != null && !playerClient.isEmpty()) request.addOption("--extractor-args", "youtube:player_client=" + playerClient);
         return request;
     }
 
@@ -719,17 +1018,16 @@ public class YtDlpPlugin extends Plugin {
         return output;
     }
 
-    private File findDownloadedFile(File dir, String id) {
-        File exactMp3 = new File(dir, id + ".mp3");
-        if (exactMp3.isFile() && exactMp3.length() > 0) return exactMp3;
-        File[] files = dir.listFiles((parent, name) -> name.startsWith(id + ".")
-            && !name.endsWith(".part") && !name.endsWith(".ytdl"));
+    private File findDownloadedFile(File dir, String outputKey) {
+        File[] files = dir.listFiles((parent, name) -> name.startsWith(outputKey + ".") &&
+            !name.endsWith(".part") && !name.endsWith(".ytdl") && !name.endsWith(".tmp"));
         if (files == null || files.length == 0) return null;
-        File biggest = files[0];
+        File best = null;
         for (File file : files) {
-            if (file.length() > biggest.length()) biggest = file;
+            if (!file.isFile() || file.length() < 256 || !isPlausibleAudioFile(file)) continue;
+            if (best == null || file.length() > best.length()) best = file;
         }
-        return biggest;
+        return best;
     }
 
     private String actualAudioFormat(File file, String fallbackLabel) {
@@ -776,26 +1074,26 @@ public class YtDlpPlugin extends Plugin {
         return fallbackUrl;
     }
 
-    private void publishDownload(File source, String title, String id) throws Exception {
-        String displayName = downloadDisplayName(source, title, id);
+    private void publishDownload(File source, String artist, String title, String id) throws Exception {
+        String displayName = downloadDisplayName(source, artist, title);
         String treeText = storagePrefs().getString(DOWNLOAD_TREE_URI, "");
-        if (treeText != null && !treeText.isEmpty()) {
-            exportToSelectedDownloadFolder(source, displayName);
-        } else {
-            saveToPublicMusic(source, displayName);
-        }
+        if (treeText != null && !treeText.isEmpty()) exportToSelectedDownloadFolder(source, displayName);
+        else saveToPublicMusic(source, displayName);
     }
 
-    private String downloadDisplayName(File source, String title, String id) {
-        String cleanTitle = safe(title).replaceAll("[\\\\/:*?\\\"<>|\\p{Cntrl}]", "_")
-            .replaceAll("\\s+", " ").trim();
-        if (cleanTitle.isEmpty()) cleanTitle = "YouTube";
-        if (cleanTitle.length() > 100) cleanTitle = cleanTitle.substring(0, 100).trim();
+    private String downloadDisplayName(File source, String artist, String title) {
+        String cleanArtist = cleanArtistName(artist);
+        String cleanTitle = cleanYouTubeTitle(title, "");
+        String base = (cleanArtist.isEmpty() ? "" : cleanArtist + " - ") + fallback(cleanTitle, "Без названия");
+        base = base.replaceAll("[\\\\/:*?\"<>|\\p{Cc}]", "_")
+            .replaceAll("\\s+", " ").replaceAll("[. ]+$", "").trim();
+        if (base.isEmpty()) base = "Crimson Track";
+        if (base.length() > 180) base = base.substring(0, 180).trim();
         String extension = "";
         String filename = source.getName();
         int dot = filename.lastIndexOf('.');
         if (dot >= 0 && dot < filename.length() - 1) extension = filename.substring(dot).toLowerCase(Locale.ROOT);
-        return cleanTitle + " [" + id + "]" + extension;
+        return base + extension;
     }
 
     private void saveToPublicMusic(File source, String displayName) throws Exception {
@@ -914,9 +1212,12 @@ public class YtDlpPlugin extends Plugin {
     private boolean validUrl(String value) { return value != null && value.toLowerCase(Locale.ROOT).startsWith("https://"); }
     private String cleanFilePart(String value) { return value.replaceAll("[^A-Za-z0-9_-]", ""); }
     private String safeMessage(Throwable ex) {
-        Throwable current=ex;
-        while (current.getCause()!=null && current.getCause()!=current) current=current.getCause();
-        String message=current.getMessage();
-        return message==null || message.trim().isEmpty() ? current.getClass().getSimpleName() : message;
+        Throwable current = ex;
+        while (current.getCause() != null && current.getCause() != current) current = current.getCause();
+        String message = current.getMessage();
+        if (message == null || message.trim().isEmpty()) message = current.getClass().getSimpleName();
+        return message.replaceAll("(?i)(cookie(?:s)?(?:file)?[=: ]+)[^\\s]+", "$1[REDACTED]")
+            .replaceAll("(?i)(authorization[=: ]+bearer\\s+)[^\\s]+", "$1[REDACTED]");
     }
+
 }
