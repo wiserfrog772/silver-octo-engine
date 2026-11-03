@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+: облачная копия и перенос на новое устройство включают только папку backup/. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="file" path="backup/" />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="file" path="backup/" />
+    </device-transfer>
+</data-extraction-rules>

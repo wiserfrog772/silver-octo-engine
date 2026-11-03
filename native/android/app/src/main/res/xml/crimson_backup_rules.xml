@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 и ниже: в Auto Backup попадает только папка с копией плейлистов (небольшие JSON-файлы).
+     Данные WebView и кеш медиатеки не копируются: они большие и могли бы сорвать всю резервную копию (лимит 25 МБ). -->
+<full-backup-content>
+    <include domain="file" path="backup/" />
+</full-backup-content>

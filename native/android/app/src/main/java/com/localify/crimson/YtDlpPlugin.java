@@ -37,6 +37,7 @@ import org.json.JSONArray;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
@@ -46,6 +47,7 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @CapacitorPlugin(name = "CrimsonYtDlp")
 public class YtDlpPlugin extends Plugin {
@@ -423,6 +425,264 @@ public class YtDlpPlugin extends Plugin {
         return target;
     }
 
+
+    // ===== Резервные копии пользовательских данных =====
+    @PluginMethod
+    public void saveBackup(PluginCall call) {
+        final String json = call.getString("json", "");
+        executor.execute(() -> {
+            try {
+                BackupStore.save(getContext(), json);
+                boolean mirrored = BackupStore.mirror(getContext(), storagePrefs().getString(LIBRARY_TREE_URI, ""), json);
+                mirrored = BackupStore.mirror(getContext(), storagePrefs().getString(DOWNLOAD_TREE_URI, ""), json) || mirrored;
+                JSObject result = new JSObject();
+                result.put("mirrored", mirrored);
+                call.resolve(result);
+            } catch (Exception ex) {
+                call.reject("Не удалось сохранить резервную копию: " + safeMessage(ex));
+            }
+        });
+    }
+
+    @PluginMethod
+    public void readBackups(PluginCall call) {
+        executor.execute(() -> {
+            JSArray backups = new JSArray();
+            for (String[] item : BackupStore.readAllCandidates(getContext(),
+                    storagePrefs().getString(LIBRARY_TREE_URI, ""), storagePrefs().getString(DOWNLOAD_TREE_URI, ""))) {
+                JSObject entry = new JSObject();
+                entry.put("source", item[0]);
+                entry.put("text", item[1]);
+                backups.put(entry);
+            }
+            JSObject result = new JSObject();
+            result.put("backups", backups);
+            call.resolve(result);
+        });
+    }
+
+    @PluginMethod
+    public void wipeBackups(PluginCall call) {
+        executor.execute(() -> {
+            BackupStore.wipe(getContext(), storagePrefs().getString(LIBRARY_TREE_URI, ""), storagePrefs().getString(DOWNLOAD_TREE_URI, ""));
+            call.resolve();
+        });
+    }
+
+    @PluginMethod
+    public void exportFile(PluginCall call) {
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/json");
+        intent.putExtra(Intent.EXTRA_TITLE, call.getString("name", "crimson-backup.json"));
+        startActivityForResult(call, intent, "exportFileResult");
+    }
+
+    @ActivityCallback
+    private void exportFileResult(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {
+            call.reject("Экспорт отменён.");
+            return;
+        }
+        final Uri target = result.getData().getData();
+        final String text = call.getString("text", "");
+        executor.execute(() -> {
+            try (OutputStream out = getContext().getContentResolver().openOutputStream(target, "wt")) {
+                if (out == null) throw new IllegalStateException("Файл недоступен для записи.");
+                out.write(text.getBytes(StandardCharsets.UTF_8));
+                call.resolve();
+            } catch (Exception ex) {
+                call.reject("Не удалось записать файл: " + safeMessage(ex));
+            }
+        });
+    }
+
+    @PluginMethod
+    public void importFile(PluginCall call) {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        startActivityForResult(call, intent, "importFileResult");
+    }
+
+    @ActivityCallback
+    private void importFileResult(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {
+            call.reject("Импорт отменён.");
+            return;
+        }
+        final Uri source = result.getData().getData();
+        executor.execute(() -> {
+            try (java.io.InputStream in = getContext().getContentResolver().openInputStream(source)) {
+                if (in == null) throw new IllegalStateException("Файл недоступен для чтения.");
+                JSObject response = new JSObject();
+                response.put("text", BackupStore.readAll(in));
+                call.resolve(response);
+            } catch (Exception ex) {
+                call.reject("Не удалось прочитать файл: " + safeMessage(ex));
+            }
+        });
+    }
+
+    // ===== Структурированные метаданные YouTube без обработки: разбор выполняет JS (единый механизм) =====
+    @PluginMethod
+    public void fetchTrackMetadata(PluginCall call) {
+        final String url = call.getString("url", "");
+        if (url == null || url.isEmpty()) { call.reject("Не указана ссылка."); return; }
+        executor.execute(() -> {
+            try {
+                ensureReady();
+                JSONObject metadata = readTrackMetadata(url);
+                JSONObject info = new JSONObject();
+                for (String key : new String[] {"id", "title", "track", "artist", "artists", "album_artist", "album_artists", "creator", "creators",
+                        "uploader", "channel", "album", "release_date", "release_year", "upload_date", "genre", "genres"}) {
+                    if (metadata.has(key) && !metadata.isNull(key)) info.put(key, metadata.get(key));
+                }
+                JSObject result = new JSObject();
+                result.put("info", info);
+                call.resolve(result);
+            } catch (Exception ex) {
+                call.reject("Не удалось получить метаданные: " + safeMessage(ex));
+            }
+        });
+    }
+
+    // ===== Фоновое сканирование папки: пачки событий, пропуск неизменённых файлов, отмена =====
+    private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "crimson-library-scan");
+        thread.setPriority(Thread.NORM_PRIORITY - 1);
+        return thread;
+    });
+    private final AtomicBoolean scanRunning = new AtomicBoolean(false);
+    private final AtomicBoolean scanCancelled = new AtomicBoolean(false);
+    private static final int SCAN_BATCH = 20;
+
+    @PluginMethod
+    public void startLibraryScan(PluginCall call) {
+        final String treeText = storagePrefs().getString(LIBRARY_TREE_URI, "");
+        JSObject started = new JSObject();
+        if (treeText == null || treeText.isEmpty()) {
+            started.put("selected", false);
+            call.resolve(started);
+            return;
+        }
+        if (!scanRunning.compareAndSet(false, true)) {
+            started.put("selected", true);
+            started.put("alreadyRunning", true);
+            call.resolve(started);
+            return;
+        }
+        scanCancelled.set(false);
+        final JSObject known = call.getObject("known");
+        started.put("selected", true);
+        call.resolve(started);
+        scanExecutor.execute(() -> {
+            try {
+                runLibraryScan(treeText, known);
+            } catch (Throwable ex) {
+                JSObject event = new JSObject();
+                event.put("type", "error");
+                event.put("message", "Не удалось просканировать папку: " + safeMessage(ex));
+                notifyListeners("libraryScanEvent", event);
+            } finally {
+                scanRunning.set(false);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void cancelLibraryScan(PluginCall call) {
+        scanCancelled.set(true);
+        call.resolve();
+    }
+
+    private void collectAudioDocuments(DocumentFile directory, List<DocumentFile> output) {
+        if (scanCancelled.get()) return;
+        DocumentFile[] children = directory.listFiles();
+        for (DocumentFile child : children) {
+            if (scanCancelled.get()) return;
+            if (child == null) continue;
+            if (child.isDirectory()) collectAudioDocuments(child, output);
+            else if (child.isFile() && isAudioDocument(child)) output.add(child);
+        }
+    }
+
+    private void runLibraryScan(String treeText, JSObject known) throws Exception {
+        DocumentFile root = DocumentFile.fromTreeUri(getContext(), Uri.parse(treeText));
+        if (root == null || !root.isDirectory()) {
+            throw new IllegalStateException("Выбранная папка недоступна. Выбери её заново в настройках.");
+        }
+        List<DocumentFile> documents = new ArrayList<>();
+        collectAudioDocuments(root, documents);   // вложенные папки
+        if (scanCancelled.get()) { emitScan("cancelled", 0, 0, 0, ""); return; }
+        emitScan("counted", documents.size(), 0, 0, "");
+
+        JSArray batch = new JSArray();
+        int processed = 0;
+        int corrupted = 0;
+        for (DocumentFile document : documents) {
+            if (scanCancelled.get()) break;
+            String name = document.getName() == null ? "audio" : document.getName();
+            String sourceUri = document.getUri().toString();
+            try {
+                JSObject item = new JSObject();
+                item.put("sourceId", sourceUri);
+                JSONObject knownEntry = known == null ? null : known.optJSONObject(sourceUri);
+                long size = document.length();
+                long modified = document.lastModified();
+                if (knownEntry != null && knownEntry.optLong("size", -1) == size
+                        && knownEntry.optLong("lastModified", -1) == modified && knownEntry.optBoolean("hasDuration", false)) {
+                    item.put("unchanged", true);          // метаданные заново не читаем
+                    item.put("size", size);
+                    item.put("lastModified", modified);
+                    item.put("name", name);
+                } else {
+                    File localFile = cacheLibraryDocument(document);
+                    item.put("name", name);
+                    item.put("path", localFile.getAbsolutePath());
+                    item.put("size", localFile.length());
+                    item.put("duration", readAudioDurationSeconds(localFile));
+                    item.put("lastModified", modified);
+                    String coverPath = cacheEmbeddedCover(localFile, sourceUri);
+                    if (!coverPath.isEmpty()) item.put("coverPath", coverPath);
+                }
+                batch.put(item);
+            } catch (Exception ex) {
+                corrupted++;   // повреждённый или нечитаемый файл не останавливает сканирование
+            }
+            processed++;
+            if (batch.length() >= SCAN_BATCH || processed == documents.size()) {
+                emitBatch(batch, documents.size(), processed, corrupted, name);
+                batch = new JSArray();
+            }
+        }
+        if (batch.length() > 0) emitBatch(batch, documents.size(), processed, corrupted, "");
+        emitScan(scanCancelled.get() ? "cancelled" : "done", documents.size(), processed, corrupted, "");
+    }
+
+    private void emitBatch(JSArray rows, int total, int processed, int corrupted, String currentName) {
+        JSObject event = new JSObject();
+        event.put("type", "batch");
+        event.put("rows", rows);
+        event.put("total", total);
+        event.put("processed", processed);
+        event.put("corrupted", corrupted);
+        event.put("currentName", currentName);
+        notifyListeners("libraryScanEvent", event);
+    }
+
+    private void emitScan(String type, int total, int processed, int corrupted, String currentName) {
+        JSObject event = new JSObject();
+        event.put("type", type);
+        event.put("total", total);
+        event.put("processed", processed);
+        event.put("corrupted", corrupted);
+        event.put("currentName", currentName);
+        notifyListeners("libraryScanEvent", event);
+    }
+
     @PluginMethod
     public void status(PluginCall call) {
         // Non-initializing: the first real yt-dlp action extracts the bundled runtime.
@@ -567,6 +827,21 @@ public class YtDlpPlugin extends Plugin {
         return "";
     }
 
+    /** Записывает готовые значения как литералы: символы % и : экранируются для шаблона yt-dlp. */
+    private void addLiteralTag(YoutubeDLRequest request, String field, String value) {
+        if (value == null || value.trim().isEmpty()) return;
+        String literal = value.trim().replace("%", "%%").replace(":", "\\:");
+        request.addOption("--parse-metadata", literal + ":%(" + field + ")s");
+    }
+
+    private void addResolvedTags(YoutubeDLRequest request, String title, String artist, String album, String year, String genre) {
+        addLiteralTag(request, "meta_title", title);
+        addLiteralTag(request, "meta_artist", artist);
+        addLiteralTag(request, "meta_album", album);
+        addLiteralTag(request, "meta_genre", genre);
+        if (year != null && year.matches("\\d{4}")) addLiteralTag(request, "meta_date", year);
+    }
+
     private JSONObject readTrackMetadata(String url) {
         try {
             YoutubeDLRequest request = baseRequest(url)
@@ -705,15 +980,31 @@ public class YtDlpPlugin extends Plugin {
             try {
                 ensureReady();
                 File outputDir = musicOutputDirectory();
-                JSONObject metadata = readTrackMetadata(url);
-                String title = cleanYouTubeTitle(firstMetadataValue(metadata, "track", "title"), "");
-                if (title.isEmpty()) title = cleanYouTubeTitle(requestedTitle, id);
-                if (title.isEmpty()) title = "Без названия";
-                String artist = cleanArtistName(firstMetadataValue(metadata, "artists", "artist", "album_artists", "album_artist", "creator", "uploader", "channel"));
-                if (artist.isEmpty()) artist = requestedArtist;
-                String album = cleanYouTubeTitle(firstMetadataValue(metadata, "album"), "");
-                String year = releaseYear(metadata);
-                String genre = firstMetadataValue(metadata, "genre", "genres", "categories");
+                // Если JS уже определил исполнителя и название (единый механизм track-identity), используем
+                // именно эти значения для тегов и имени файла и не запрашиваем метаданные второй раз.
+                final boolean resolved = call.getBoolean("resolved", false);
+                String title;
+                String artist;
+                String album;
+                String year;
+                String genre;
+                if (resolved) {
+                    title = requestedTitle == null || requestedTitle.trim().isEmpty() ? "Без названия" : requestedTitle.trim();
+                    artist = requestedArtist == null ? "" : requestedArtist.trim();
+                    album = call.getString("album", "");
+                    year = call.getString("year", "");
+                    genre = call.getString("genre", "");
+                } else {
+                    JSONObject metadata = readTrackMetadata(url);
+                    title = cleanYouTubeTitle(firstMetadataValue(metadata, "track", "title"), "");
+                    if (title.isEmpty()) title = cleanYouTubeTitle(requestedTitle, id);
+                    if (title.isEmpty()) title = "Без названия";
+                    artist = cleanArtistName(firstMetadataValue(metadata, "artists", "artist", "album_artists", "album_artist", "creator", "uploader", "channel"));
+                    if (artist.isEmpty()) artist = requestedArtist;
+                    album = cleanYouTubeTitle(firstMetadataValue(metadata, "album"), "");
+                    year = releaseYear(metadata);
+                    genre = firstMetadataValue(metadata, "genre", "genres", "categories");
+                }
                 boolean hasCookies = getCookiesFile() != null;
 
                 // Start with yt-dlp's normal client negotiation; retry with cookies disabled
@@ -764,11 +1055,16 @@ public class YtDlpPlugin extends Plugin {
                                 .addOption("--extractor-retries", "3")
                                 .addOption("--fragment-retries", "3")
                                 .addOption("-f", strategy[2])
-                                .addOption("--parse-metadata", "%(track,title)s:^(?P<meta_title>.+?)(?:\\s*(?:[-–—|•·]\\s*)?[\\[(]?(?:official(?:\\s+music)?\\s+(?:video|audio)|music\\s+video|lyric(?:s)?(?:\\s+video)?|visualizer|audio\\s*hq|full\\s*hd|ultra\\s*hd|4k|2160p|1440p|1080p|720p|480p|hd)[\\])]?)+$")
-                                .addOption("--parse-metadata", "%(artist,artists,creator,creators,uploader,uploader_id)s:^(?P<meta_artist>.+?)(?:\\s*(?:[-–—|•·]\\s*)?(?:official(?:\\s+artist)?(?:\\s+channel)?|vevo|topic))+$")
                                 .addOption("--embed-metadata")
                                 .addOption("--embed-thumbnail")
                                 .addOption("-o", new File(outputDir, outputKey + ".%(ext)s").getAbsolutePath());
+                            if (resolved) {
+                                // Теги пишем из единого механизма: Title без исполнителя, Artist отдельно.
+                                addResolvedTags(request, title, artist, album, year, genre);
+                            } else {
+                                request.addOption("--parse-metadata", "%(track,title)s:^(?P<meta_title>.+?)(?:\\s*(?:[-–—|•·]\\s*)?[\\[(]?(?:official(?:\\s+music)?\\s+(?:video|audio)|music\\s+video|lyric(?:s)?(?:\\s+video)?|visualizer|audio\\s*hq|full\\s*hd|ultra\\s*hd|4k|2160p|1440p|1080p|720p|480p|hd)[\\])]?)+$");
+                                request.addOption("--parse-metadata", "%(artist,artists,creator,creators,uploader,uploader_id)s:^(?P<meta_artist>.+?)(?:\\s*(?:[-–—|•·]\\s*)?(?:official(?:\\s+artist)?(?:\\s+channel)?|vevo|topic))+$");
+                            }
                             if (transcode) {
                                 request.addOption("-x")
                                     .addOption("--audio-format", "mp3")
