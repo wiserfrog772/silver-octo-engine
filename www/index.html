@@ -71,6 +71,13 @@
           <div class="scan-panel hidden" role="status" aria-live="polite"><div class="scan-head"><strong class="scan-message"></strong><button type="button" class="scan-cancel secondary-button hidden">Отмена</button></div><div class="scan-bar"><span></span></div><div class="scan-counters"></div><div class="scan-file"></div></div>
         </article>
         <article class="settings-card">
+          <div class="settings-card-title"><span class="settings-symbol">✎</span><div><h3>Исправление названий</h3><p>Повторно определяет исполнителя и название по именам файлов. Перед изменением создаётся резервная копия; аудиофайлы, плейлисты и идентификаторы треков не меняются. Изменение можно отменить.</p></div></div>
+          <div class="settings-actions">
+            <button id="repairMetadata" type="button" class="primary-button">Исправить названия</button>
+            <button id="undoMetadataRepair" type="button" class="secondary-button">Отменить исправление</button>
+          </div>
+        </article>
+        <article class="settings-card">
           <div class="settings-card-title"><span class="settings-symbol">⛨</span><div><h3>Данные и резервные копии</h3><p>Плейлисты, порядок треков и настройки хранятся вне библиотеки и копируются автоматически. После переустановки они восстанавливаются сами, а треки сопоставляются по названию и исполнителю после сканирования папки.</p></div></div>
           <div id="dataStatus" class="settings-status">Резервная копия создаётся автоматически после изменений.</div>
           <div class="settings-actions">

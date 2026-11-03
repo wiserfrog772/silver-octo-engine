@@ -55,9 +55,10 @@ test('6. Featuring сохраняется', () => {
   const a = run({ title: 'Drake ft. Rihanna - Take Care' });
   assert.equal(a.artist, 'Drake feat. Rihanna');
   assert.equal(a.title, 'Take Care');
+  // Участник из «(feat. X)» переходит к исполнителю, информация не теряется
   const b = run({ title: 'Drake - Take Care (feat. Rihanna)' });
-  assert.equal(b.artist, 'Drake');
-  assert.equal(b.title, 'Take Care (feat. Rihanna)');
+  assert.equal(b.artist, 'Drake feat. Rihanna');
+  assert.equal(b.title, 'Take Care');
   const c = run({ title: 'Drake - Take Care', info: { artist: 'Drake feat. Rihanna', track: 'Drake - Take Care' } });
   assert.equal(c.title, 'Take Care');
   assert.equal(c.artist, 'Drake feat. Rihanna');

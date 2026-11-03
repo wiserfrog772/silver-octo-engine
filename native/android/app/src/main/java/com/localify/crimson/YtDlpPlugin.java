@@ -535,11 +535,7 @@ public class YtDlpPlugin extends Plugin {
             try {
                 ensureReady();
                 JSONObject metadata = readTrackMetadata(url);
-                JSONObject info = new JSONObject();
-                for (String key : new String[] {"id", "title", "track", "artist", "artists", "album_artist", "album_artists", "creator", "creators",
-                        "uploader", "channel", "album", "release_date", "release_year", "upload_date", "genre", "genres"}) {
-                    if (metadata.has(key) && !metadata.isNull(key)) info.put(key, metadata.get(key));
-                }
+                JSONObject info = identityFields(metadata);
                 JSObject result = new JSObject();
                 result.put("info", info);
                 call.resolve(result);
@@ -827,6 +823,16 @@ public class YtDlpPlugin extends Plugin {
         return "";
     }
 
+    /** Поля yt-dlp, нужные для определения исполнителя и названия. Разбор выполняет JS (единый механизм). */
+    private JSONObject identityFields(JSONObject metadata) throws Exception {
+        JSONObject info = new JSONObject();
+        for (String key : new String[] {"id", "title", "track", "artist", "artists", "album_artist", "album_artists", "creator", "creators",
+                "uploader", "channel", "album", "release_date", "release_year", "upload_date", "genre", "genres"}) {
+            if (metadata.has(key) && !metadata.isNull(key)) info.put(key, metadata.get(key));
+        }
+        return info;
+    }
+
     /** Записывает готовые значения как литералы: символы % и : экранируются для шаблона yt-dlp. */
     private void addLiteralTag(YoutubeDLRequest request, String field, String value) {
         if (value == null || value.trim().isEmpty()) return;
@@ -914,6 +920,7 @@ public class YtDlpPlugin extends Plugin {
                 result.put("url", streamUrl);
                 result.put("title", fallback(title, "Без названия"));
                 result.put("artist", artist);
+                result.put("info", identityFields(metadata));   // JS определяет исполнителя и название единым механизмом
                 result.put("album", firstMetadataValue(metadata, "album"));
                 result.put("year", releaseYear(metadata));
                 result.put("genre", firstMetadataValue(metadata, "genre", "genres", "categories"));
@@ -1122,7 +1129,7 @@ public class YtDlpPlugin extends Plugin {
                     Log.e(TAG, "All download strategies failed for video " + id + ": " + failures);
                     throw new IllegalStateException(friendlyDownloadFailure(failures.toString()));
                 }
-                publishDownload(downloaded, artist, title, id);
+                publishDownload(downloaded, artist, title, id, resolved);
                 JSObject result = new JSObject();
                 result.put("path", downloaded.getAbsolutePath());
                 result.put("title", title);
@@ -1370,16 +1377,17 @@ public class YtDlpPlugin extends Plugin {
         return fallbackUrl;
     }
 
-    private void publishDownload(File source, String artist, String title, String id) throws Exception {
-        String displayName = downloadDisplayName(source, artist, title);
+    private void publishDownload(File source, String artist, String title, String id, boolean resolved) throws Exception {
+        String displayName = downloadDisplayName(source, artist, title, resolved);
         String treeText = storagePrefs().getString(DOWNLOAD_TREE_URI, "");
         if (treeText != null && !treeText.isEmpty()) exportToSelectedDownloadFolder(source, displayName);
         else saveToPublicMusic(source, displayName);
     }
 
-    private String downloadDisplayName(File source, String artist, String title) {
-        String cleanArtist = cleanArtistName(artist);
-        String cleanTitle = cleanYouTubeTitle(title, "");
+    private String downloadDisplayName(File source, String artist, String title, boolean resolved) {
+        // Значения от JS уже прошли единый механизм: повторная очистка могла бы изменить их, поэтому только trim.
+        String cleanArtist = resolved ? safe(artist) : cleanArtistName(artist);
+        String cleanTitle = resolved ? safe(title) : cleanYouTubeTitle(title, "");
         String base = (cleanArtist.isEmpty() ? "" : cleanArtist + " - ") + fallback(cleanTitle, "Без названия");
         base = base.replaceAll("[\\\\/:*?\"<>|\\p{Cc}]", "_")
             .replaceAll("\\s+", " ").replaceAll("[. ]+$", "").trim();

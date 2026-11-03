@@ -3,7 +3,7 @@
  * Чистая логика: нативный слой отдаёт найденные файлы пачками, а здесь решается, что добавить,
  * что обновить, что удалить и что пропустить как дубликат. Тяжёлые операции в UI не выполняются.
  */
-import { artistKey } from './track-identity.mjs';
+import { artistKey, stripAudioExtension } from './track-identity.mjs';
 
 const FOLDER_PREFIX = 'folder:';
 const YT_ID_RE = /[[(]([A-Za-z0-9_-]{11})[)\]]\s*$/;
@@ -20,7 +20,7 @@ export function youtubeIdFromFilename(name) {
 export function fileFingerprint(row) {
   const size = Number(row.size) || 0;
   if (size <= 0) return '';
-  const name = String(row.name || '').replace(/\.[^.]+$/, '').toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+  const name = stripAudioExtension(String(row.name || '')).toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
   return `${name}|${size}`;
 }
 

@@ -5,9 +5,10 @@ import { escapeHtml, formatTimeLabel, pluralTrackCount } from './modules/ui.mjs'
 import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies } from './modules/youtube.mjs';
 import { movePlaylistTrack, movePlaylistTrackToPosition } from './modules/playlist-order.mjs';
 import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent, swipeVisual } from './modules/track-interactions.mjs';
-import { buildTrackMetadata, parseLibraryFilename } from './modules/track-identity.mjs';
+import { buildTrackMetadata, libraryNameFromFilename, stripAudioExtension } from './modules/track-identity.mjs';
 import { createLibraryMatcher, matchBadge, MATCH_LEVEL } from './modules/library-match.mjs';
 import { createSnapshot, encodeBackup, decodeBackup, pickNewestValidBackup, exportPlaylists, importPlaylists, checkPlaylistIntegrity, reconcilePlaylists, updatePlaylistRefs, normalizePlaylist, writeGuarded, readGuarded } from './modules/backup.mjs';
+import { planRepairs, applyRepairs, undoRepairs, describeRepairs } from './modules/metadata-repair.mjs';
 import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, isScanActive, scanSummary, isFolderTrack } from './modules/scan-plan.mjs';
 
 (() => {
@@ -149,7 +150,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   function storedShape(track) {
     return {
       id: track.id, name: track.name, artist: track.artist, blob: track.blob || null,
-      fileName: track.fileName || '', nativePath: track.nativePath || '', sourceId: track.sourceId || '', addedAt: track.addedAt,
+      fileName: track.fileName || '', lastModified: Number(track.lastModified) || 0, nativePath: track.nativePath || '', sourceId: track.sourceId || '', addedAt: track.addedAt,
       duration: Number(track.duration) || 0, size: Number(track.size) || 0,
       album: track.album || '', year: track.year || '', genre: track.genre || '',
       importKey: track.importKey || '', youtubeId: track.youtubeId || '', coverBlob: track.coverBlob || null,
@@ -312,7 +313,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   }
 
   function extractYouTubeIdFromTitle(value) {
-    const title = String(value || '').trim().replace(/\.[^.]+$/, '');
+    const title = stripAudioExtension(String(value || '').trim());
     const match = title.match(/(?:\[([A-Za-z0-9_-]{11})\]|\(([A-Za-z0-9_-]{11})\))\s*$/);
     return match ? (match[1] || match[2] || '') : '';
   }
@@ -1184,6 +1185,10 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
       state.playbackOrder = libraryOrderIds();
       notifyLibraryChanged({ skipReconcile: true });
       render();
+      setTimeout(() => {
+        const damaged = planRepairs(state.tracks).length;
+        if (damaged) showToast('Найдено треков с повреждёнными названиями: ' + damaged + '. Настройки → «Исправить названия».');
+      }, 3000);
       if (state.pendingNativeSnapshot) {
         const snapshot = state.pendingNativeSnapshot;
         state.pendingNativeSnapshot = null;
@@ -1201,10 +1206,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   }
 
   function parseFilename(filename) {
-    const raw = String(filename || '').replace(/\.[^.]+$/, '').replace(/[_]+/g, ' ').trim();
-    const sourceVideoId = extractYouTubeIdFromTitle(raw);
-    // Те же правила, что и при скачивании: исполнитель не дублируется и не выдумывается.
-    const parsed = parseLibraryFilename(cleanYouTubeTitle(raw, sourceVideoId));
+    const parsed = libraryNameFromFilename(filename);
     return { artist: parsed.artist || 'Неизвестный исполнитель', name: parsed.name || 'Без названия' };
   }
 
@@ -2209,6 +2211,8 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   $('#restoreBackup').addEventListener('click', () => { void restoreFromBackup(); });
   $('#restoreBackupFile').addEventListener('click', () => { void restoreFromChosenFile(); });
   $('#checkIntegrity').addEventListener('click', () => { void runIntegrityCheck(); });
+  $('#repairMetadata').addEventListener('click', () => { void repairLibraryMetadata(); });
+  $('#undoMetadataRepair').addEventListener('click', () => { void undoMetadataRepair(); });
   $('#wipeData').addEventListener('click', () => { void wipeAllUserData(); });
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') void saveBackupNow(); });
   $('#refreshLibraryFolder').addEventListener('click', () => refreshExternalLibrary({ force: true }));
@@ -3010,6 +3014,49 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     } catch (error) { library.textContent = 'Не удалось получить настройки папок: ' + (error?.message || error); }
   }
 
+  // ===== Исправление ранее повреждённых названий и исполнителей =====
+  const REPAIR_UNDO_KEY = 'crimson.mobile.metadata-undo';
+
+  async function persistChangedTracks(before, after) {
+    const old = new Map(before.map((track) => [track.id, track]));
+    const changed = after.filter((track) => old.get(track.id) !== track);
+    if (changed.length) await putRecords(changed.map(storedShape));
+    return changed.length;
+  }
+
+  async function repairLibraryMetadata() {
+    const plan = planRepairs(state.tracks);
+    if (!plan.length) { showToast('Исправлять нечего: названия и исполнители в порядке.'); return; }
+    const message = 'Найдено треков для исправления: ' + plan.length + '\n\n' + describeRepairs(plan) +
+      '\n\nПеред изменением будет создана резервная копия. Аудиофайлы, плейлисты и идентификаторы треков не меняются. Исправить?';
+    if (!window.confirm(message)) return;
+    await saveBackupNow();
+    try {
+      const { tracks, undo } = applyRepairs(state.tracks, plan);
+      try { localStorage.setItem(REPAIR_UNDO_KEY, JSON.stringify({ at: Date.now(), undo })); } catch (_) {}
+      const before = state.tracks;
+      const count = await persistChangedTracks(before, tracks);
+      state.tracks = tracks;
+      savePlaylists();       // обновляет ссылки refs плейлистов новыми названиями
+      notifyLibraryChanged({ skipReconcile: true });
+      render();
+      showToast('Исправлено треков: ' + count + '. Можно отменить в настройках.');
+    } catch (error) { showToast('Не удалось исправить названия: ' + (error && error.message || error)); }
+  }
+
+  async function undoMetadataRepair() {
+    let journal = null;
+    try { journal = JSON.parse(localStorage.getItem(REPAIR_UNDO_KEY) || 'null'); } catch (_) {}
+    if (!journal || !Array.isArray(journal.undo) || !journal.undo.length) { showToast('Нет исправлений для отмены.'); return; }
+    if (!window.confirm('Вернуть прежние названия у ' + journal.undo.length + ' треков?')) return;
+    const before = state.tracks;
+    state.tracks = undoRepairs(before, journal.undo);
+    await persistChangedTracks(before, state.tracks);
+    localStorage.removeItem(REPAIR_UNDO_KEY);
+    savePlaylists(); notifyLibraryChanged({ skipReconcile: true }); render();
+    showToast('Прежние названия возвращены.');
+  }
+
   // ===== Автоматическое сканирование папки: фоновый поток в Java, пачки событий, отмена =====
   function attachScanListener() {
     const plugin = window.CrimsonYtDlp;
@@ -3311,9 +3358,11 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
       state.currentId = null;
       state.nativeQueueOrder = null;
       state.nativeQueueLastKey = '';
+      // Тот же механизм, что при скачивании: канал не подменяет исполнителя.
+      const identity = buildTrackMetadata({ title: video.title || info.title, videoId: video.id, info: info.info || {} });
       state.currentRemoteTrack = {
-        id:'youtube:'+video.id, name:cleanYouTubeTitle(info.title || video.title || 'YouTube', video.id),
-        artist:cleanArtistName(info.artist || ''),
+        id:'youtube:'+video.id, name: identity.title,
+        artist: identity.artist,
         duration:Number(info.duration || video.duration)||0, addedAt:Date.now(), size:0, url:info.url, isRemote:true,
         coverUrl: info.thumbnail || video.thumbnail || ('https://i.ytimg.com/vi/' + encodeURIComponent(video.id) + '/hqdefault.jpg')
       };

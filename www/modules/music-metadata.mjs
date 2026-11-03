@@ -14,9 +14,15 @@ function normalizeText(value) {
   return String(value ?? '').normalize('NFC').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+// Сегмент считается мусором, только если ВСЕ его слова служебные. Раньше хватало одного совпадения,
+// поэтому «(Why Do Lyrics Hurt)» или «[Black Parade 4K Edition]» теряли часть настоящего названия.
+const NOISE_WORDS = new Set([
+  'official', 'music', 'video', 'audio', 'lyrics', 'lyric', 'lyrical', 'visualizer', 'visualiser', 'clip', 'new', 'full',
+  'ultra', 'hq', 'hd', '4k', '8k', '2160p', '1440p', '1080p', '720p', '480p', '360p'
+]);
 function isNoiseSegment(value) {
-  const text = normalizeText(value).replace(/[()[\]{}]/g, '').trim();
-  return !!text && TECHNICAL_RE.test(text) && !VERSION_RE.test(text);
+  const words = normalizeText(value).replace(/[()[\]{}]/g, ' ').toLocaleLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  return words.length > 0 && words.every((word) => NOISE_WORDS.has(word)) && !VERSION_RE.test(value);
 }
 
 function cleanBracketedNoise(value) {
@@ -57,6 +63,8 @@ export function cleanTrackTitle(value, videoId = '') {
   const parts = title.split(/\s*[|•·]\s*/);
   while (parts.length > 1 && isNoiseSegment(parts[parts.length - 1])) parts.pop();
   title = parts.join(' | ');
+  // Очистка не должна уничтожить название целиком: «Lyrics», «HD» и т. п. могут быть настоящим названием.
+  if (!/[\p{L}\p{N}]/u.test(title)) return normalizeText(value);
   title = title
     .replace(/[\s|•·-]+$/g, '')
     .replace(/^[\s|•·]+/g, '')
