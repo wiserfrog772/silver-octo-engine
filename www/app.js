@@ -4,7 +4,11 @@ import { uniqueExistingTrackIds, sortLibraryTracks, playbackIdsForView as resolv
 import { escapeHtml, formatTimeLabel, pluralTrackCount } from './modules/ui.mjs';
 import { normalizeYoutubeResults, friendlyYoutubeError, validateNetscapeCookies } from './modules/youtube.mjs';
 import { movePlaylistTrack, movePlaylistTrackToPosition } from './modules/playlist-order.mjs';
-import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from './modules/track-interactions.mjs';
+import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent, swipeVisual } from './modules/track-interactions.mjs';
+import { buildTrackMetadata, parseLibraryFilename } from './modules/track-identity.mjs';
+import { createLibraryMatcher, matchBadge, MATCH_LEVEL } from './modules/library-match.mjs';
+import { createSnapshot, encodeBackup, decodeBackup, pickNewestValidBackup, exportPlaylists, importPlaylists, checkPlaylistIntegrity, reconcilePlaylists, updatePlaylistRefs, normalizePlaylist, writeGuarded, readGuarded } from './modules/backup.mjs';
+import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, isScanActive, scanSummary, isFolderTrack } from './modules/scan-plan.mjs';
 
 (() => {
   'use strict';
@@ -13,7 +17,7 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
   // IndexedDB cannot be renamed in place, and changing it would hide every track
   // that existing installations have already imported.
   const DB_NAME = 'localify-crimson-mobile';
-  const DB_VERSION = 1;
+  const DB_VERSION = 2; // v2: индексы sourceId / youtubeId / addedAt (миграция без потери данных)
   const STORE = 'tracks';
   const STORAGE_KEYS = {
     queue: 'crimson.mobile.queue',
@@ -28,6 +32,8 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
   };
   const SORT_MODES = ['recent', 'title', 'artist'];
   const libraryStore = createLibraryStore({ databaseName: DB_NAME, version: DB_VERSION, storeName: STORE });
+  const SWIPE_HINT = '<div class="track-swipe-hint" aria-hidden="true"><span class="swipe-icon"><svg viewBox="0 0 24 24" class="swipe-icon-add"><path d="M4 6h12M4 12h8M4 18h6M18 12v8m-4-4h8"/></svg><svg viewBox="0 0 24 24" class="swipe-icon-done"><path d="M5 13l4 4L19 7"/></svg></span><small>Добавить в плейлист</small></div>';
+  const libraryMatcher = createLibraryMatcher();
   const collator = new Intl.Collator(['ru', 'en'], { numeric: true, sensitivity: 'base' });
 
   migratePreferenceKeys(localStorage, STORAGE_KEYS, LEGACY_STORAGE_KEYS);
@@ -71,6 +77,8 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
     libraryRefreshRequested: false,
     libraryRefreshRequestedSilent: true,
     lastFolderScanAt: 0,
+    scan: createScanState(), scanSeen: null, scanListenerAttached: false, scanAdded: 0,
+    allowEmptyBackup: false, renderLimit: 150, libraryDirty: true, backupTimer: null, lastBackupAt: 0, backupStatus: '',
     lastMediaMetadataKey: '',
     lastMediaPlaybackState: '',
     nativePlaybackLastKey: '',
@@ -387,8 +395,14 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
     state.toastTimer = setTimeout(() => toast.classList.remove('visible'), 3600);
   }
 
+  // Индекс по id: раньше каждый вызов был линейным поиском, а плейлисты и очередь вызывают его для каждого трека.
+  const trackIndex = { source: null, length: -1, map: new Map() };
   function trackById(id) {
-    return state.tracks.find((track) => track.id === id) || null;
+    if (trackIndex.source !== state.tracks || trackIndex.length !== state.tracks.length) {
+      trackIndex.source = state.tracks; trackIndex.length = state.tracks.length;
+      trackIndex.map = new Map(state.tracks.map((track) => [track.id, track]));
+    }
+    return trackIndex.map.get(id) || null;
   }
 
   function cleanYouTubeTitle(title, videoId) {
@@ -414,10 +428,14 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
 
   function savePlaylists() {
     try {
-      localStorage.setItem(STORAGE_KEYS.playlists, JSON.stringify(state.playlists.map((playlist) => ({
-        id: playlist.id, name: playlist.name, trackIds: playlist.trackIds, createdAt: playlist.createdAt || Date.now()
-      }))));
+      state.playlists.forEach((playlist) => { playlist.refs = updatePlaylistRefs(playlist, trackById); });
+      // Запись с контрольной суммой и предыдущей исправной копией: обрыв записи не повредит плейлисты.
+      writeGuarded(localStorage, STORAGE_KEYS.playlists, state.playlists.map((playlist) => ({
+        id: playlist.id, name: playlist.name, trackIds: playlist.trackIds, refs: playlist.refs, createdAt: playlist.createdAt || Date.now()
+      })));
     } catch (_) { showToast('Не удалось сохранить плейлисты на устройстве.'); }
+    if (state.playlists.length) state.allowEmptyBackup = true;
+    scheduleBackup();
   }
 
   function saveQuickAddPlaylist(playlistId) {
@@ -426,6 +444,7 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
       if (state.quickAddPlaylistId) localStorage.setItem(STORAGE_KEYS.quickAddPlaylist, state.quickAddPlaylistId);
       else localStorage.removeItem(STORAGE_KEYS.quickAddPlaylist);
     } catch (_) {}
+    scheduleBackup();
   }
 
   function libraryTracks() {
@@ -514,6 +533,38 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
     return '<div class="empty-state"><div class="empty-glyph">♫</div><h3>' + (state.query ? 'Ничего не найдено' : 'Твоя медиатека пока пуста') + '</h3><p>' + (state.query ? 'Попробуй другое название или имя исполнителя.' : 'Добавь аудиофайлы с телефона. Они останутся в приложении и будут доступны без интернета.') + '</p>' + (!state.query ? '<button class="primary-button" data-import="true">Добавить музыку</button>' : '') + '</div>';
   }
 
+  const SORT_LABELS = { recent: 'Сначала новые', title: 'По названию', artist: 'По исполнителю' };
+  let loadMoreObserver = null;
+  function observeLoadMore() {
+    const button = $('#trackList').querySelector('[data-load-more]');
+    if (!button) return;
+    const more = () => { state.renderLimit += 200; renderList(); };
+    button.onclick = more;
+    if (!('IntersectionObserver' in window)) return;
+    if (loadMoreObserver) loadMoreObserver.disconnect();
+    loadMoreObserver = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) { loadMoreObserver.disconnect(); more(); } }, { rootMargin: '400px' });
+    loadMoreObserver.observe(button);
+  }
+
+  function renderFilterBar() {
+    const bar = $('#filterBar');
+    if (!bar) return;
+    bar.classList.toggle('hidden', state.view === 'queue');
+    bar.querySelectorAll('[data-sort]').forEach((button) => {
+      const active = button.dataset.sort === state.sortMode;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-checked', String(active));
+      button.tabIndex = active ? 0 : -1;
+    });
+    const active = $('#activeFilters');
+    const chips = [];
+    if (state.sortMode !== 'recent') chips.push('<button type="button" class="filter-chip" data-clear="sort" aria-label="Сбросить сортировку">' + esc(SORT_LABELS[state.sortMode]) + '<span aria-hidden="true">×</span></button>');
+    if (state.query) chips.push('<button type="button" class="filter-chip" data-clear="query" aria-label="Сбросить поиск">«' + esc(state.query.slice(0, 24)) + '»<span aria-hidden="true">×</span></button>');
+    if (chips.length > 1) chips.push('<button type="button" class="filter-reset" data-clear="all">Сбросить всё</button>');
+    active.innerHTML = chips.join('');
+    active.classList.toggle('has-filters', chips.length > 0);
+  }
+
   function renderList() {
     const isYoutube = state.view === 'youtube';
     const isSettings = state.view === 'settings';
@@ -536,15 +587,14 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
       button.classList.toggle('active', active);
       if (active) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
     });
-    const sortSelect = $('#sortSelect');
-    if (sortSelect) {
-      sortSelect.value = state.sortMode;
-      sortSelect.classList.toggle('hidden', state.view === 'queue');
-    }
+    renderFilterBar();
     if (isYoutube || isSettings || isPlaylists) return;
     if (!tracks.length) { list.innerHTML = emptyMarkup(); return; }
-    list.innerHTML = tracks.map((track) => {
-      const active = currentTrack();
+    const limited = state.view === 'library' && tracks.length > state.renderLimit;
+    const shownTracks = limited ? tracks.slice(0, state.renderLimit) : tracks;
+    const activeTrackNow = currentTrack();
+    list.innerHTML = shownTracks.map((track) => {
+      const active = activeTrackNow;
       const playing = Boolean(active && active.id === track.id);
       const currentQueueTrack = state.view === 'queue' && playing;
       const explicitlyQueued = state.view === 'queue' && state.queue.includes(track.id);
@@ -562,20 +612,21 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
         '<details class="track-context-menu"><summary class="track-action track-more-action" aria-label="Другие действия с композицией" title="Действия">⋮</summary>' +
           '<div class="track-context-popover" role="group" aria-label="Действия с композицией"><button type="button" data-action="add-to-playlist" data-id="' + esc(track.id) + '">Добавить в плейлист…</button></div></details>';
       return '<article class="track-row' + (playing ? ' playing' : '') + '" data-track="' + esc(track.id) + '">' +
-        '<div class="track-swipe-hint" aria-hidden="true"><span>＋</span><small>Добавить<br>в плейлист</small></div>' + coverMarkup(track) +
+        SWIPE_HINT + coverMarkup(track) +
         '<div class="track-main" data-action="play" data-id="' + esc(track.id) + '" role="button" tabindex="0" aria-label="Воспроизвести ' + esc(track.name) + '">' +
           '<div class="track-name">' + esc(track.name) + '</div><div class="track-artist">' + esc(track.artist || 'Неизвестный исполнитель') + '</div>' +
         '</div>' +
         '<div class="track-meta">' + meta + '</div>' +
         '<div class="track-actions">' + mainAction + playlistAction + '</div></article>';
-    }).join('');
+    }).join('') + (limited ? '<button type="button" class="load-more" data-load-more>Показать ещё (' + (tracks.length - shownTracks.length) + ')</button>' : '');
+    if (limited) observeLoadMore();
   }
 
   function renderPlaylistTrack(track, position, total) {
     const canMoveUp = position > 0;
     const canMoveDown = position < total - 1;
     return '<article class="track-row playlist-track-row" data-playlist-track="' + esc(track.id) + '" data-position="' + (position + 1) + '">' +
-      '<div class="track-swipe-hint" aria-hidden="true"><span>＋</span><small>Добавить<br>в плейлист</small></div>' +
+      SWIPE_HINT +
       '<button class="playlist-reorder-handle" data-reorder-handle="true" type="button" aria-label="Перетащить ' + esc(track.name) + '" title="Перетащить для изменения порядка">⠿</button>' +
       '<span class="playlist-track-position" aria-label="Позиция ' + (position + 1) + '">' + (position + 1) + '</span>' +
       coverMarkup(track) +
@@ -869,6 +920,192 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
     renderPlayer();
   }
 
+  // ===== Сохранность данных: резервные копии, восстановление, экспорт/импорт, проверка =====
+  function waitForNativePlugin(timeoutMs = 1500) {
+    if (window.CrimsonYtDlp) return Promise.resolve(window.CrimsonYtDlp);
+    return new Promise((resolve) => {
+      const done = () => resolve(window.CrimsonYtDlp || null);
+      window.addEventListener('crimson-yt-dlp-ready', done, { once: true });
+      setTimeout(done, timeoutMs);
+    });
+  }
+  const backupPlugin = () => (window.CrimsonYtDlp && typeof window.CrimsonYtDlp.saveBackup === 'function' ? window.CrimsonYtDlp : null);
+
+  function buildBackupSnapshot() {
+    return createSnapshot({
+      playlists: state.playlists, tracks: state.tracks, queue: state.queue,
+      quickAddPlaylistId: state.quickAddPlaylistId, playbackPlaylistId: state.playbackPlaylistId,
+      sortMode: state.sortMode, settings: { sortMode: state.sortMode }
+    });
+  }
+
+  function scheduleBackup() {
+    clearTimeout(state.backupTimer);
+    state.backupTimer = setTimeout(() => { void saveBackupNow(); }, 1800);
+  }
+
+  async function saveBackupNow() {
+    clearTimeout(state.backupTimer);
+    const plugin = backupPlugin();
+    if (!plugin || !state.libraryLoaded) return null;
+    // Пустое состояние не затирает хорошую копию: после неудачного восстановления ничего не теряется.
+    if (!state.playlists.length && !state.allowEmptyBackup) return null;
+    try {
+      const result = await plugin.saveBackup({ json: encodeBackup(buildBackupSnapshot()) });
+      state.lastBackupAt = Date.now();
+      state.backupStatus = 'Последняя копия: ' + new Date(state.lastBackupAt).toLocaleString('ru-RU') + (result && result.mirrored ? ' · дубль в папке' : '');
+      refreshDataStatus();
+      return result;
+    } catch (error) {
+      console.warn('Backup failed', error);
+      state.backupStatus = 'Не удалось сохранить резервную копию: ' + (error && error.message || error);
+      refreshDataStatus();
+      return null;
+    }
+  }
+
+  function refreshDataStatus(extra = '') {
+    const node = $('#dataStatus');
+    if (!node) return;
+    const count = state.playlists.length;
+    node.textContent = [pluralPlaylists(count), state.backupStatus || 'Резервная копия создаётся автоматически после изменений.', extra].filter(Boolean).join(' · ');
+  }
+  function pluralPlaylists(n) {
+    const last = n % 10, tens = n % 100;
+    if (tens > 10 && tens < 20) return n + ' плейлистов';
+    if (last === 1) return n + ' плейлист';
+    return n + (last > 1 && last < 5 ? ' плейлиста' : ' плейлистов');
+  }
+
+  /** Читает копии из приватной папки приложения и из выбранной папки пользователя. */
+  async function readNativeBackups() {
+    await waitForNativePlugin();
+    const plugin = window.CrimsonYtDlp;
+    if (!plugin || typeof plugin.readBackups !== 'function') return [];
+    try { const result = await plugin.readBackups(); return Array.isArray(result && result.backups) ? result.backups : []; } catch (_) { return []; }
+  }
+
+  async function loadStoredPlaylists() {
+    const stored = readGuarded(localStorage, STORAGE_KEYS.playlists, []);
+    state.allowEmptyBackup = !stored.missing;
+    let list = Array.isArray(stored.value) ? stored.value : [];
+    let note = stored.recovered ? 'Плейлисты восстановлены из предыдущей исправной копии.' : '';
+    if (stored.missing) {
+      // Данных нет: первый запуск или переустановка. Ищем резервную копию.
+      const { best } = pickNewestValidBackup(await readNativeBackups());
+      if (best && best.snapshot.data.playlists.length) {
+        list = best.snapshot.data.playlists;
+        const extras = best.snapshot.data;
+        if (extras.quickAddPlaylistId) state.quickAddPlaylistId = extras.quickAddPlaylistId;
+        if (SORT_MODES.includes(extras.sortMode)) { state.sortMode = extras.sortMode; try { localStorage.setItem(STORAGE_KEYS.sort, state.sortMode); } catch (_) {} }
+        note = 'Плейлисты восстановлены из резервной копии: ' + list.length + '. Треки подтянутся после сканирования папки.';
+      }
+    }
+    return { playlists: list.map((item) => normalizePlaylist(item)).filter(Boolean), note };
+  }
+
+  async function exportPlaylistsFile() {
+    const plugin = await waitForNativePlugin();
+    if (!plugin || typeof plugin.exportFile !== 'function') { showToast('Экспорт доступен в установленном APK.'); return; }
+    try {
+      await plugin.exportFile({ name: 'crimson-playlists.json', text: exportPlaylists(state.playlists, state.tracks) });
+      showToast('Плейлисты экспортированы.');
+    } catch (error) { if (!/отмен/i.test(String(error && error.message || error))) showToast('Не удалось экспортировать: ' + (error && error.message || error)); }
+  }
+
+  async function importPlaylistsFile() {
+    const plugin = await waitForNativePlugin();
+    if (!plugin || typeof plugin.importFile !== 'function') { showToast('Импорт доступен в установленном APK.'); return; }
+    try {
+      const picked = await plugin.importFile();
+      const result = importPlaylists(picked.text, state.playlists, state.tracks);
+      if (!result.ok) { showToast(result.error); return; }
+      await saveBackupNow(); // снимок текущего состояния перед применением
+      state.playlists = result.playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) }));
+      savePlaylists(); render();
+      const r = result.report;
+      showToast('Импорт: новых ' + r.added + ', объединено ' + r.merged + (r.tracksMissing ? ', не найдено треков: ' + r.tracksMissing : '') + '.');
+    } catch (error) { if (!/отмен/i.test(String(error && error.message || error))) showToast('Не удалось импортировать: ' + (error && error.message || error)); }
+  }
+
+  async function restoreFromBackup() {
+    const { best, problems } = pickNewestValidBackup(await readNativeBackups());
+    if (!best) { showToast(problems.length ? 'Копии найдены, но повреждены: ' + problems[0].error : 'Резервные копии не найдены.'); return; }
+    const when = best.snapshot.createdAt ? new Date(best.snapshot.createdAt).toLocaleString('ru-RU') : 'неизвестно';
+    if (!window.confirm('Восстановить плейлисты (' + best.snapshot.data.playlists.length + ') из копии от ' + when + '? Текущие плейлисты будут заменены; перед этим сохранится их копия.')) return;
+    await saveBackupNow();
+    const reconciled = reconcilePlaylists(best.snapshot.data.playlists, state.tracks);
+    state.playlists = reconciled.playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) }));
+    savePlaylists(); render();
+    showToast('Восстановлено плейлистов: ' + state.playlists.length + (reconciled.pending ? '. Не найдено пока треков: ' + reconciled.pending : '.'));
+  }
+
+  async function restoreFromChosenFile() {
+    const plugin = await waitForNativePlugin();
+    if (!plugin || typeof plugin.importFile !== 'function') return;
+    try {
+      const picked = await plugin.importFile();
+      const decoded = decodeBackup(picked.text);
+      if (!decoded.ok) { showToast(decoded.error); return; }
+      if (!window.confirm('Заменить текущие плейлисты данными из файла (' + decoded.snapshot.data.playlists.length + ')?')) return;
+      await saveBackupNow();
+      const reconciled = reconcilePlaylists(decoded.snapshot.data.playlists, state.tracks);
+      state.playlists = reconciled.playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) }));
+      savePlaylists(); render();
+      showToast('Данные восстановлены из файла.');
+    } catch (error) { if (!/отмен/i.test(String(error && error.message || error))) showToast('Не удалось восстановить: ' + (error && error.message || error)); }
+  }
+
+  async function runIntegrityCheck() {
+    const problems = [];
+    try {
+      const records = await getAllRecords();
+      if (!Array.isArray(records)) problems.push('база треков вернула некорректные данные');
+    } catch (error) { problems.push('база треков недоступна: ' + (error && error.message || error)); }
+    const stored = readGuarded(localStorage, STORAGE_KEYS.playlists, []);
+    if (stored.recovered) problems.push('основная запись плейлистов была повреждена и восстановлена из копии');
+    const report = checkPlaylistIntegrity(state.playlists, state.tracks);
+    report.issues.forEach((issue) => {
+      if (issue.type === 'missing-tracks') problems.push('в плейлисте «' + issue.playlist + '» ссылок на отсутствующие треки: ' + issue.count);
+      else problems.push('проблема структуры: ' + issue.type);
+    });
+    if (problems.length && report.issues.length) {
+      state.playlists = report.playlists.filter((p) => p).map((playlist) => {
+        const live = state.playlists.find((item) => item.id === playlist.id);
+        return live ? { ...live, trackIds: uniqueTrackIds(playlist.trackIds) } : playlist;
+      });
+      savePlaylists(); render();
+    }
+    refreshDataStatus(problems.length ? 'Проверка: исправлено/найдено — ' + problems.join('; ') : 'Проверка пройдена: проблем не найдено');
+    showToast(problems.length ? 'Проверка завершена: найдено замечаний — ' + problems.length : 'Проверка целостности пройдена.');
+  }
+
+  async function wipeAllUserData() {
+    if (!window.confirm('Удалить ВСЕ данные Crimson: плейлисты, настройки, медиатеку и резервные копии? Это действие нельзя отменить.')) return;
+    if (!window.confirm('Точно удалить всё? Файлы музыки в выбранных папках останутся нетронутыми.')) return;
+    try {
+      const plugin = window.CrimsonYtDlp;
+      if (plugin && typeof plugin.wipeBackups === 'function') await plugin.wipeBackups();
+      Object.keys(localStorage).filter((key) => key.startsWith('crimson.mobile.') || key.startsWith('localify.mobile.')).forEach((key) => localStorage.removeItem(key));
+      libraryStore.close(state.db); state.db = null;
+      await new Promise((resolve) => { const r = indexedDB.deleteDatabase(DB_NAME); r.onsuccess = r.onerror = r.onblocked = () => resolve(); });
+      location.reload();
+    } catch (error) { showToast('Не удалось удалить данные: ' + (error && error.message || error)); }
+  }
+
+  /** Вызывается после любого изменения состава библиотеки. */
+  function notifyLibraryChanged({ skipReconcile = false } = {}) {
+    state.libraryDirty = true;
+    if (!skipReconcile && state.playlists.some((playlist) => (playlist.refs || []).some((ref) => !trackById(ref.id) && (ref.name || ref.sourceId || ref.youtubeId)))) {
+      const result = reconcilePlaylists(state.playlists, state.tracks);
+      if (result.resolved) {
+        state.playlists = result.playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) }));
+        savePlaylists();
+      }
+    }
+    if (state.view === 'youtube') renderOnlineResults();
+  }
+
   async function loadLibrary() {
     try {
       state.db = await openDatabase();
@@ -930,13 +1167,12 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
         state.queue = [];
       }
       try {
-        const stored = JSON.parse(localStorage.getItem(STORAGE_KEYS.playlists) || '[]');
-        state.playlists = Array.isArray(stored) ? stored.filter((item) => item && item.id && String(item.name || '').trim()).map((item) => ({
-          id: String(item.id), name: String(item.name).trim().slice(0, 60),
-          trackIds: uniqueTrackIds(Array.isArray(item.trackIds) ? item.trackIds : []),
-          createdAt: Number(item.createdAt) || Date.now()
-        })) : [];
-      } catch (_) { state.playlists = []; }
+        const loaded = await loadStoredPlaylists();
+        // Ссылки на треки сопоставляются с библиотекой: после переустановки id другие, а плейлисты остаются.
+        const reconciled = reconcilePlaylists(loaded.playlists, state.tracks);
+        state.playlists = reconciled.playlists.map((item) => ({ ...item, name: item.name.slice(0, 60), trackIds: uniqueTrackIds(item.trackIds) }));
+        if (loaded.note) showToast(loaded.note);
+      } catch (error) { console.error('Playlists load failed', error); state.playlists = []; }
       savePlaylists();
       if (state.quickAddPlaylistId && !playlistById(state.quickAddPlaylistId)) saveQuickAddPlaylist(null);
       try {
@@ -946,6 +1182,7 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
         if (!state.playbackPlaylistId && savedPlaybackPlaylist) localStorage.removeItem(STORAGE_KEYS.playbackPlaylist);
       } catch (_) { state.playbackPlaylistId = null; }
       state.playbackOrder = libraryOrderIds();
+      notifyLibraryChanged({ skipReconcile: true });
       render();
       if (state.pendingNativeSnapshot) {
         const snapshot = state.pendingNativeSnapshot;
@@ -966,10 +1203,9 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
   function parseFilename(filename) {
     const raw = String(filename || '').replace(/\.[^.]+$/, '').replace(/[_]+/g, ' ').trim();
     const sourceVideoId = extractYouTubeIdFromTitle(raw);
-    const clean = cleanYouTubeTitle(raw, sourceVideoId);
-    const parts = clean.split(/\s+-\s+/);
-    if (parts.length >= 2) return { artist: parts.shift().trim(), name: parts.join(' - ').trim() || clean };
-    return { artist: 'Неизвестный исполнитель', name: clean || 'Без названия' };
+    // Те же правила, что и при скачивании: исполнитель не дублируется и не выдумывается.
+    const parsed = parseLibraryFilename(cleanYouTubeTitle(raw, sourceVideoId));
+    return { artist: parsed.artist || 'Неизвестный исполнитель', name: parsed.name || 'Без названия' };
   }
 
   function supportedAudio(file) {
@@ -1281,6 +1517,7 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
     } catch (error) {
       console.error(error);
     }
+    if (added) notifyLibraryChanged();
     render();
     if (added) showToast('Добавлено: ' + pluralTracks(added) + (added < selected.length ? '. Остальные уже были в медиатеке.' : '.'));
     else showToast('Не удалось сохранить файлы. Проверь свободное место на телефоне.');
@@ -1330,7 +1567,10 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
     state.tracks = state.tracks.filter((item) => item.id !== id);
     state.queue = state.queue.filter((item) => item !== id);
     state.playbackOrder = state.playbackOrder.filter((item) => item !== id);
-    state.playlists.forEach((playlist) => { playlist.trackIds = playlist.trackIds.filter((item) => item !== id); });
+    state.playlists.forEach((playlist) => {
+      playlist.trackIds = playlist.trackIds.filter((item) => item !== id);
+      if (Array.isArray(playlist.refs)) playlist.refs = playlist.refs.filter((ref) => ref.id !== id);
+    });
     const activePlaybackPlaylist = playlistById(state.playbackPlaylistId);
     if (activePlaybackPlaylist) refreshActivePlaylistPlayback(activePlaybackPlaylist);
     saveQueue();
@@ -1345,6 +1585,7 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
         }
       }
       releaseTrackUrls(track);
+      notifyLibraryChanged({ skipReconcile: true });
       render();
       showToast('Трек удалён из медиатеки.');
     } catch (error) {
@@ -1961,6 +2202,15 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
   });
 
   $('#chooseLibraryFolder').addEventListener('click', chooseLibraryFolder);
+  document.querySelectorAll('.scan-cancel').forEach((button) => button.addEventListener('click', () => { void cancelLibraryScan(); }));
+  $('#exportPlaylists').addEventListener('click', () => { void exportPlaylistsFile(); });
+  $('#importPlaylists').addEventListener('click', () => { void importPlaylistsFile(); });
+  $('#backupNow').addEventListener('click', async () => { const r = await saveBackupNow(); showToast(r ? 'Резервная копия создана.' : 'Резервная копия недоступна в этой среде.'); });
+  $('#restoreBackup').addEventListener('click', () => { void restoreFromBackup(); });
+  $('#restoreBackupFile').addEventListener('click', () => { void restoreFromChosenFile(); });
+  $('#checkIntegrity').addEventListener('click', () => { void runIntegrityCheck(); });
+  $('#wipeData').addEventListener('click', () => { void wipeAllUserData(); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') void saveBackupNow(); });
   $('#refreshLibraryFolder').addEventListener('click', () => refreshExternalLibrary({ force: true }));
   $('#chooseDownloadFolder').addEventListener('click', chooseDownloadFolder);
   $('#resetDownloadFolder').addEventListener('click', resetDownloadFolder);
@@ -2024,14 +2274,34 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
 
   $('#importTop').addEventListener('click', importDialog);
   filePicker.addEventListener('change', () => importFiles(filePicker.files));
-  $('#sortSelect').addEventListener('change', (event) => {
-    const mode = event.target.value;
+  function setSortMode(mode) {
     state.sortMode = SORT_MODES.includes(mode) ? mode : 'recent';
+    state.renderLimit = 150;
     try { localStorage.setItem(STORAGE_KEYS.sort, state.sortMode); } catch (_) {}
+    scheduleBackup();
     renderList();
+  }
+  $('#filterBar').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-sort]');
+    if (button) setSortMode(button.dataset.sort);
+  });
+  $('#filterBar').addEventListener('keydown', (event) => {
+    if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+    const index = SORT_MODES.indexOf(state.sortMode);
+    const next = SORT_MODES[(index + (event.key === 'ArrowRight' ? 1 : SORT_MODES.length - 1)) % SORT_MODES.length];
+    setSortMode(next);
+    $('#filterBar [data-sort="' + next + '"]').focus();
+  });
+  $('#activeFilters').addEventListener('click', (event) => {
+    const target = event.target.closest('[data-clear]');
+    if (!target) return;
+    const what = target.dataset.clear;
+    if (what === 'query' || what === 'all') { state.query = ''; $('#searchInput').value = ''; }
+    if (what === 'sort' || what === 'all') setSortMode('recent'); else { state.renderLimit = 150; renderList(); }
   });
   $('#searchInput').addEventListener('input', (event) => {
     state.query = event.currentTarget.value || '';
+    state.renderLimit = 150;
     clearTimeout(state.searchRenderTimer);
     state.searchRenderTimer = setTimeout(renderList, 70);
   });
@@ -2042,12 +2312,14 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
 
   function resetTrackSwipeRow(row) {
     if (!row || (!row.classList.contains('track-swipe-active') && !row.style.getPropertyValue('--swipe-offset'))) return;
-    row.classList.remove('track-swipe-active');
+    row.classList.remove('track-swipe-active', 'track-swipe-ready');
     row.classList.add('track-swipe-settling');
     row.style.setProperty('--swipe-offset', '0px');
+    row.style.setProperty('--swipe-progress', '0');
     setTimeout(() => {
       row.classList.remove('track-swipe-settling');
       row.style.removeProperty('--swipe-offset');
+      row.style.removeProperty('--swipe-progress');
     }, 230);
   }
 
@@ -2056,7 +2328,7 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
     const target = resolveSwipePlaylist(state.playlists, state.quickAddPlaylistId, sourcePlaylistId);
     if (target && !target.trackIds.includes(gesture.trackId)) {
       addTrackToPlaylist(target.id, gesture.trackId, { undoable: true });
-      return;
+      return true;
     }
     if (target && target.trackIds.includes(gesture.trackId)) {
       const anotherAvailable = state.playlists.some((playlist) => playlist.id !== sourcePlaylistId && !playlist.trackIds.includes(gesture.trackId));
@@ -2105,8 +2377,14 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
     if (direction === 'right' || direction === 'commit') {
       gesture.active = true;
       event.preventDefault();
+      const visual = swipeVisual(dx);
+      const wasArmed = gesture.armed;
+      gesture.armed = visual.armed;
       gesture.row.classList.add('track-swipe-active');
-      gesture.row.style.setProperty('--swipe-offset', Math.min(92, Math.max(0, dx)) + 'px');
+      gesture.row.classList.toggle('track-swipe-ready', visual.armed);
+      gesture.row.style.setProperty('--swipe-offset', visual.offset + 'px');
+      gesture.row.style.setProperty('--swipe-progress', String(visual.progress));
+      if (visual.armed && !wasArmed && navigator.vibrate) { try { navigator.vibrate(10); } catch (_) {} }
     }
   }, { passive: false });
 
@@ -2124,10 +2402,16 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
       gesture.row.classList.add('track-swipe-settling');
       gesture.row.style.setProperty('--swipe-offset', '0px');
       setTimeout(() => {
-        gesture.row.classList.remove('track-swipe-active', 'track-swipe-settling');
+        gesture.row.classList.remove('track-swipe-active', 'track-swipe-settling', 'track-swipe-ready');
         gesture.row.style.removeProperty('--swipe-offset');
+        gesture.row.style.removeProperty('--swipe-progress');
       }, 230);
-      completeTrackSwipe(gesture);
+      const added = completeTrackSwipe(gesture);
+      if (added) {
+        // Короткое подтверждение: галочка и подсветка строки, затем строка уже вернулась на место.
+        gesture.row.classList.add('track-swipe-added');
+        setTimeout(() => gesture.row.classList.remove('track-swipe-added'), 900);
+      }
     } else {
       resetTrackSwipeRow(gesture.row);
     }
@@ -2726,111 +3010,154 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
     } catch (error) { library.textContent = 'Не удалось получить настройки папок: ' + (error?.message || error); }
   }
 
-  async function refreshExternalLibrary(options = {}) {
-    const silent = Boolean(options.silent);
-    const force = Boolean(options.force);
-    if (!nativeYtDlp() || !state.db) return;
-    if (state.libraryRefreshing) {
-      if (force) {
-        state.libraryRefreshRequested = true;
-        state.libraryRefreshRequestedSilent = silent;
-      }
-      return;
-    }
-    if (!force && state.lastFolderScanAt && Date.now() - state.lastFolderScanAt < 30000) return;
-    state.libraryRefreshing = true;
+  // ===== Автоматическое сканирование папки: фоновый поток в Java, пачки событий, отмена =====
+  function attachScanListener() {
+    const plugin = window.CrimsonYtDlp;
+    if (!plugin || typeof plugin.addListener !== 'function' || state.scanListenerAttached) return;
+    state.scanListenerAttached = true;
+    plugin.addListener('libraryScanEvent', (event) => { void handleScanEvent(event || {}); });
+  }
+
+  function renderScanProgress() {
+    const scan = state.scan;
+    const visible = scan.phase !== 'idle';
+    document.querySelectorAll('.scan-panel').forEach((panel) => {
+      panel.classList.toggle('hidden', !visible);
+      if (!visible) return;
+      const active = isScanActive(scan);
+      panel.dataset.phase = scan.phase;
+      const bar = panel.querySelector('.scan-bar > span');
+      if (bar) bar.style.width = (active && !scan.total ? 8 : scan.percent) + '%';
+      panel.querySelector('.scan-bar').classList.toggle('indeterminate', active && !scan.total);
+      panel.querySelector('.scan-message').textContent = scan.phase === 'done' ? 'Готово: ' + scanSummary(scan) : scan.message;
+      panel.querySelector('.scan-counters').textContent = scan.total
+        ? 'Обработано ' + scan.processed + ' из ' + scan.total + ' · добавлено ' + scan.added + ' · пропущено ' + scan.skipped
+        : (active ? 'Подсчёт файлов…' : '');
+      panel.querySelector('.scan-file').textContent = active ? scan.currentName : '';
+      panel.querySelector('.scan-cancel').classList.toggle('hidden', !active);
+    });
+  }
+
+  function scheduleScanRender() {
+    if (state.scanRenderTimer) return;
+    state.scanRenderTimer = setTimeout(() => {
+      state.scanRenderTimer = null;
+      renderScanProgress();
+      if (state.view === 'library') renderList();
+    }, 250);
+  }
+
+  function folderRecordFromRow(row, old) {
+    const sourceId = String(row.sourceId || row.path);
+    const names = parseFilename(row.name);
+    const youtubeId = extractYouTubeIdFromTitle(row.name) || (old && old.youtubeId) || '';
+    return {
+      id: old ? old.id : 'folder:' + sourceId,
+      name: names.name, artist: names.artist, blob: null,
+      nativePath: row.path, sourceId, youtubeId, fileName: row.name, lastModified: Number(row.lastModified) || 0,
+      coverPath: row.coverPath || (old && old.coverPath) || '',
+      coverUrl: (old && old.coverUrl) || (youtubeId ? 'https://i.ytimg.com/vi/' + encodeURIComponent(youtubeId) + '/hqdefault.jpg' : ''),
+      coverBlob: (old && old.coverBlob) || null,
+      addedAt: old ? old.addedAt : Date.now(),
+      duration: Number(row.duration) > 0 ? Number(row.duration) : (old ? (Number(old.duration) || 0) : 0),
+      size: Number(row.size) || 0
+    };
+  }
+
+  async function handleScanEvent(event) {
     try {
-      const result = await window.CrimsonYtDlp.scanLibraryFolder();
-      if (result.selected === false) {
-        state.lastFolderScanAt = Date.now();
-        await refreshFolderSettings();
-        return;
-      }
-      const sourceRows = Array.isArray(result.files) ? result.files : [];
-      const rowBySource = new Map();
-      for (const row of sourceRows) {
-        if (!row || !row.path || !row.name) continue;
-        const sourceId = String(row.sourceId || row.path);
-        if (!rowBySource.has(sourceId)) rowBySource.set(sourceId, row);
-      }
-      const rows = Array.from(rowBySource.values()).filter((row) => {
-        const youtubeId = extractYouTubeIdFromTitle(row.name);
-        if (!youtubeId) return true;
-        const sourceId = String(row.sourceId || row.path);
-        const matching = state.tracks.filter((track) =>
-          String(track.youtubeId || '') === youtubeId ||
-          (/^[A-Za-z0-9_-]{11}$/.test(String(track.sourceId || '')) && String(track.sourceId) === youtubeId));
-        if (!matching.length) return true;
-        if (matching.some((track) => !String(track.id || '').startsWith('folder:'))) return false;
-        return matching.some((track) =>
-          String(track.id || '').startsWith('folder:') && String(track.sourceId || '') === sourceId);
-      });
-      const found = new Set(rows.map((row) => String(row.sourceId || row.path)));
-      const previous = state.tracks.filter((track) => String(track.id || '').startsWith('folder:') && track.sourceId);
-      const staleIds = previous.filter((track) => !found.has(String(track.sourceId))).map((track) => track.id);
-      if (staleIds.length) await removeRecords(staleIds);
-      const staleSet = new Set(staleIds);
-      const remainingTracks = state.tracks.filter((track) => !staleSet.has(track.id));
-      const existingBySource = new Map();
-      for (const track of remainingTracks) {
-        if (String(track.id || '').startsWith('folder:') && track.sourceId && !existingBySource.has(String(track.sourceId))) {
-          existingBySource.set(String(track.sourceId), track);
+      if (event.type === 'counted') {
+        state.scan = reduceScanEvent(state.scan, event);
+      } else if (event.type === 'batch') {
+        const rows = Array.isArray(event.rows) ? event.rows : [];
+        const plan = planLibrarySync(state.tracks, rows, { complete: false });
+        plan.seen.forEach((id) => state.scanSeen && state.scanSeen.add(id));
+        const records = [];
+        for (const row of plan.add) records.push(folderRecordFromRow(row, null));
+        for (const item of plan.update) { records.push(folderRecordFromRow(item.row, item.track)); }
+        if (records.length) {
+          await putRecords(records);
+          const byId = new Map(records.map((record) => [record.id, attachUrl(record)]));
+          const replaced = state.tracks.map((track) => { const next = byId.get(track.id); if (next) { releaseTrackUrls(track); byId.delete(track.id); return next; } return track; });
+          state.tracks = replaced.concat(Array.from(byId.values()));
         }
+        state.scan = reduceScanEvent(state.scan, { type: 'progress', processed: event.processed, corrupted: event.corrupted, currentName: event.currentName });
+        state.scan = reduceScanEvent(state.scan, { type: 'plan', added: plan.add.length, updated: plan.update.length, unchanged: plan.unchanged.length, duplicates: plan.duplicates.length });
+      } else if (event.type === 'done') {
+        // Удаляем только записи файлов, которых в папке больше нет, и только после полного обхода.
+        const stale = state.tracks.filter((track) => isFolderTrack(track) && track.sourceId && state.scanSeen && !state.scanSeen.has(String(track.sourceId)));
+        if (stale.length && Number(event.total) !== 0) {
+          const ids = new Set(stale.map((track) => track.id));
+          await removeRecords(Array.from(ids));
+          state.tracks = state.tracks.filter((track) => !ids.has(track.id));
+        }
+        state.tracks.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+        state.scan = reduceScanEvent(state.scan, { type: 'done' });
+        state.lastFolderScanAt = Date.now();
+        notifyLibraryChanged();
+        scheduleBackup();
+        if (!state.scanSilent) showToast('Папка просканирована: ' + scanSummary(state.scan) + '.');
+        await refreshFolderSettings();
+        setTimeout(() => { if (!isScanActive(state.scan)) { state.scan = createScanState(); renderScanProgress(); } }, 6000);
+      } else if (event.type === 'cancelled') {
+        state.scan = reduceScanEvent(state.scan, event);
+        notifyLibraryChanged();
+        setTimeout(() => { if (!isScanActive(state.scan)) { state.scan = createScanState(); renderScanProgress(); } }, 5000);
+      } else if (event.type === 'error') {
+        state.scan = reduceScanEvent(state.scan, event);
+        if (!state.scanSilent) showToast(state.scan.message);
       }
-      const nextFolderTracks = [];
-      const recordsToSave = [];
-      let added = 0;
-      for (const row of rows) {
-        const sourceId = String(row.sourceId || row.path);
-        const old = existingBySource.get(sourceId);
-        const names = parseFilename(row.name);
-        const youtubeId = extractYouTubeIdFromTitle(row.name) || (old && old.youtubeId) || '';
-        const record = {
-          id: old ? old.id : 'folder:' + sourceId,
-          name: names.name, artist: names.artist, blob: null,
-          nativePath: row.path, sourceId, youtubeId,
-          coverPath: row.coverPath || (old && old.coverPath) || '',
-          coverUrl: (old && old.coverUrl) || (youtubeId
-            ? 'https://i.ytimg.com/vi/' + encodeURIComponent(youtubeId) + '/hqdefault.jpg' : ''),
-          coverBlob: (old && old.coverBlob) || null,
-          addedAt: old ? old.addedAt : Date.now(),
-          duration: Number(row.duration) > 0 ? Number(row.duration) : (old ? (Number(old.duration) || 0) : 0),
-          size: Number(row.size) || 0
-        };
-        recordsToSave.push(record);
-        nextFolderTracks.push(attachUrl(record));
-        if (!old) added += 1;
-      }
-      if (recordsToSave.length) await putRecords(recordsToSave);
-      const oldFolderIds = new Set(previous.map((track) => track.id));
-      previous.forEach(releaseTrackUrls);
-      state.tracks = remainingTracks.filter((track) => !oldFolderIds.has(track.id))
-        .concat(nextFolderTracks)
-        .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
-      state.lastFolderScanAt = Date.now();
-      await refreshFolderSettings();
-      render();
-      if (!silent) showToast('Папка просканирована: ' + pluralTracks(rows.length) + '.');
+      if (event.type === 'batch') scheduleScanRender(); else { renderScanProgress(); render(); }
     } catch (error) {
-      console.error('Library folder scan failed', error);
-      if (!silent) showToast('Не удалось прочитать папку: ' + (error?.message || error));
-    } finally {
-      state.libraryRefreshing = false;
-      if (state.libraryRefreshRequested) {
-        const silentNext = state.libraryRefreshRequestedSilent;
-        state.libraryRefreshRequested = false;
-        state.libraryRefreshRequestedSilent = true;
-        void refreshExternalLibrary({ silent: silentNext, force: true });
-      }
+      console.error('Scan event failed', error);
+      state.scan = reduceScanEvent(state.scan, { type: 'error', message: 'Ошибка обработки результатов: ' + (error && error.message || error) });
+      renderScanProgress();
     }
+  }
+
+  async function refreshExternalLibrary(options = {}) {
+    const force = Boolean(options.force);
+    state.scanSilent = Boolean(options.silent);
+    if (!nativeYtDlp() || !state.db) return;
+    if (isScanActive(state.scan)) return; // уже идёт: повторный запуск не создаёт второй поток
+    if (!force && state.lastFolderScanAt && Date.now() - state.lastFolderScanAt < 30000) return;
+    const plugin = window.CrimsonYtDlp;
+    if (typeof plugin.startLibraryScan !== 'function') { if (!state.scanSilent) showToast('Эта версия APK не поддерживает фоновое сканирование.'); return; }
+    attachScanListener();
+    state.scanSeen = new Set();
+    state.scan = reduceScanEvent(createScanState(), { type: 'start' });
+    renderScanProgress();
+    try {
+      const started = await plugin.startLibraryScan({ known: buildKnownSources(state.tracks) });
+      if (started && started.selected === false) { state.scan = createScanState(); renderScanProgress(); }
+    } catch (error) {
+      state.scan = reduceScanEvent(state.scan, { type: 'error', message: 'Не удалось запустить сканирование: ' + (error && error.message || error) });
+      renderScanProgress();
+    }
+  }
+
+  async function cancelLibraryScan() {
+    const plugin = window.CrimsonYtDlp;
+    if (plugin && typeof plugin.cancelLibraryScan === 'function') { try { await plugin.cancelLibraryScan(); } catch (_) {} }
   }
 
   async function chooseLibraryFolder() {
     if (!nativeYtDlp()) { showToast('Выбор папки доступен только в установленном APK.'); return; }
     try {
-      await window.CrimsonYtDlp.chooseLibraryFolder();
+      const wasSelected = Boolean((await window.CrimsonYtDlp.folderStatus()).hasLibraryFolder);
+      await window.CrimsonYtDlp.chooseLibraryFolder(); // путь сохраняется нативным слоем
+      // После переустановки в выбранной папке может лежать резервная копия плейлистов.
+      if (!state.playlists.length) {
+        const { best } = pickNewestValidBackup(await readNativeBackups());
+        if (best && best.snapshot.data.playlists.length) {
+          state.playlists = reconcilePlaylists(best.snapshot.data.playlists, state.tracks).playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) }));
+          savePlaylists();
+          showToast('Найдена резервная копия: плейлисты восстановлены (' + state.playlists.length + ').');
+        }
+      }
+      // Автоматический запуск: уже добавленная папка обновляется без дубликатов (инкрементально).
       await refreshExternalLibrary({ silent: true, force: true });
-      showToast('Источник медиатеки обновлён.');
+      if (wasSelected) showToast('Папка уже была добавлена: библиотека обновляется без дубликатов.');
     } catch (error) { if (!String(error?.message || error).toLowerCase().includes('отмен')) showToast('Не удалось выбрать папку: ' + (error?.message || error)); }
   }
 
@@ -2911,8 +3238,16 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
       root.innerHTML = state.ytLoading ? '<div class="empty-state"><div class="empty-glyph">♫</div><h3>Ищу музыку…</h3><p>yt-dlp получает результаты с YouTube.</p></div>' : '';
       return;
     }
+    if (state.libraryDirty) { libraryMatcher.update(state.tracks); state.libraryDirty = false; }
     root.innerHTML = rows.map((video) => {
       const id = esc(video.id), progress = state.ytDownloads[video.id];
+      const found = libraryMatcher.match({ title: video.title, artist: video.artist, channel: video.channel || video.uploader, duration: video.duration });
+      const badge = matchBadge(found);
+      const local = found.track;
+      const localLine = local && found.level !== MATCH_LEVEL.NONE
+        ? '<div class="library-match-file" title="' + esc(local.nativePath || local.name) + '">' + esc((local.artist ? local.artist + ' — ' : '') + local.name) + '</div>' : '';
+      const badgeMarkup = '<div class="library-match"><span class="match-badge match-' + badge.tone + '" title="' + esc(badge.hint) + '">' + esc(badge.label) + '</span>' +
+        (found.level === MATCH_LEVEL.NONE ? '' : '<button type="button" class="match-play" data-youtube-action="play-local" data-id="' + id + '" data-track-id="' + esc(local.id) + '">Воспроизвести</button>') + '</div>' + localLine;
       const downloading = progress && progress.status === 'downloading';
       const completed = progress && progress.status === 'done';
       const progressText = downloading ? ('Скачивание' + (progress.format ? ' ' + progress.format : '') + ' ' + Math.round(progress.progress || 0) + '%') : '';
@@ -2920,7 +3255,7 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
       const downloadDisabled = downloading || completed;
       const thumb = video.thumbnail ? '<img class="youtube-thumb" loading="lazy" src="' + esc(video.thumbnail) + '" alt="">' : '<div class="youtube-thumb-fallback">♫</div>';
       return '<article class="youtube-result">' + thumb + '<div class="youtube-result-copy"><div class="youtube-title">' + esc(video.title || 'Без названия') + '</div>' +
-        '<div class="youtube-meta">' + esc(video.channel || video.uploader || 'YouTube') + ' · ' + formatVideoDuration(video.duration) + '</div><div class="youtube-actions">' +
+        '<div class="youtube-meta">' + esc(video.channel || video.uploader || 'YouTube') + ' · ' + formatVideoDuration(video.duration) + '</div>' + badgeMarkup + '<div class="youtube-actions">' +
         '<button class="primary-action" data-youtube-action="play" data-id="' + id + '"' + (downloading ? ' disabled' : '') + '><svg viewBox="0 0 24 24"><path d="m8 5 12 7-12 7z"/></svg>Слушать</button>' +
         '<button data-youtube-action="download" data-id="' + id + '"' + (downloadDisabled ? ' disabled' : '') + '><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v3h16v-3"/></svg>' + downloadLabel + '</button>' +
         '</div></div></article>';
@@ -3002,11 +3337,28 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
     state.ytDownloads[video.id] = {status:'downloading',progress:0}; renderOnlineResults();
     ytStatus('Скачиваю аудио в Crimson: ' + (video.title || 'YouTube') + '…');
     try {
+      // Единый механизм: исполнитель/название определяются один раз и дальше используются
+      // для тегов, имени файла, записи в библиотеке и отображения.
+      let rawInfo = {};
+      try {
+        if (typeof window.CrimsonYtDlp.fetchTrackMetadata === 'function') {
+          const fetched = await window.CrimsonYtDlp.fetchTrackMetadata({ url: video.url });
+          rawInfo = (fetched && fetched.info) || {};
+        }
+      } catch (_) { /* метаданные необязательны: используем данные поиска */ }
+      const meta = buildTrackMetadata({
+        title: video.title, artist: video.artist, videoId: video.id,
+        info: { ...rawInfo, channel: rawInfo.channel || video.channel, uploader: rawInfo.uploader || video.uploader }
+      });
       const saved = await window.CrimsonYtDlp.downloadAudio({
         id: video.id,
         url: video.url,
-        title: video.title || 'YouTube',
-        artist: video.artist || '',
+        title: meta.title,
+        artist: meta.artist,
+        album: meta.album,
+        year: meta.year,
+        genre: meta.genre,
+        resolved: true,
         format: 'original'
       });
       const sourceId = String(video.id);
@@ -3018,8 +3370,8 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
         ? String(existing.sourceId || sourceId) : sourceId;
       const record = {
         id: existing ? existing.id : 'youtube:' + sourceId,
-        name: cleanYouTubeTitle(saved.title || video.title || 'YouTube', sourceId),
-        artist: cleanArtistName(saved.artist || video.artist || ''),
+        name: cleanYouTubeTitle(saved.title || meta.title || 'YouTube', sourceId),
+        artist: cleanArtistName(saved.artist || meta.artist || ''),
         blob: null,
         nativePath: saved.path,
         sourceId: storedSourceId,
@@ -3037,6 +3389,7 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
       if (existing) state.tracks = state.tracks.map((track) => track.id === existing.id ? attached : track);
       else state.tracks.unshift(attached);
       state.ytDownloads[video.id] = {status:'done',progress:100,format:String(saved.format || '')};
+      notifyLibraryChanged();
       render();
       ytStatus('Скачано в медиатеку Crimson: ' + record.name + ' · формат: ' + (saved.format || 'не указан'));
       showToast('Трек скачан (' + (saved.format || 'формат не указан') + ') и добавлен в медиатеку');
@@ -3049,6 +3402,7 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent } from '.
   $('#youtubeResults').addEventListener('click', (event) => {
     const button = event.target.closest('[data-youtube-action]'); if (!button) return;
     const video = state.ytResults.find((item) => String(item.id) === String(button.dataset.id)); if (!video) return;
+    if (button.dataset.youtubeAction === 'play-local') { const id = button.dataset.trackId; if (trackById(id)) void playTrack(id, libraryOrderIds()); return; }
     if (button.dataset.youtubeAction === 'play') void playYoutubeVideo(video);
     if (button.dataset.youtubeAction === 'download') void downloadYoutubeVideo(video);
   });

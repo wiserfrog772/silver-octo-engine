@@ -165,7 +165,8 @@ test('playlist sorting is wired to persistence, touch drag-and-drop and active n
   assert.match(app, /pointermove/);
   assert.match(app, /pointerup/);
   assert.match(app, /persistPlaylistOrder\(playlist, nextIds, message\)/);
-  assert.match(app, /localStorage\.setItem\(STORAGE_KEYS\.playlists/);
+  // Плейлисты пишутся через защищённую запись (контрольная сумма + предыдущая копия), а не напрямую.
+  assert.match(app, /writeGuarded\(localStorage, STORAGE_KEYS\.playlists/);
   assert.match(app, /setPlaybackPlaylist\(playlistId\)/);
   assert.match(app, /refreshActivePlaylistPlayback\(playlist\)/);
   assert.match(app, /syncNativePlayback\(true\)/);
@@ -208,4 +209,37 @@ test('быстрое добавление свайпом можно отмени
   assert.match(app, /showToast\(message, 'Отменить'/);
   assert.match(app, /current\.trackIds\.splice\(index, 1\)/);
   assert.match(app, /refreshActivePlaylistPlayback\(current\)/);
+});
+
+test('все методы нативного плагина, которые вызывает app.js, объявлены в Java', () => {
+  const app = read('www/app.js');
+  const dir = 'native/android/app/src/main/java/com/localify/crimson/';
+  const java = fs.readdirSync(path.join(root, dir)).filter((name) => name.endsWith('.java')).map((name) => read(dir + name)).join('\n');
+  const declared = new Set([...java.matchAll(/@PluginMethod\s+public void (\w+)\(/g)].map((m) => m[1]));
+  const used = new Set([...app.matchAll(/(?:window\.CrimsonYtDlp|\bplugin)\.(\w+)\(/g)].map((m) => m[1]));
+  used.delete('addListener');
+  const missing = [...used].filter((name) => !declared.has(name));
+  assert.deepEqual(missing, []);
+});
+
+test('резервные копии: правила Auto Backup, hasFragileUserData и BackupStore подключены в prepare-android', () => {
+  const script = read('scripts/prepare-android.js');
+  assert.match(script, /hasFragileUserData/);
+  assert.match(script, /crimson_backup_rules/);
+  assert.match(script, /crimson_data_extraction_rules/);
+  assert.match(script, /BackupStore\.java/);
+  const rules = read('native/android/app/src/main/res/xml/crimson_backup_rules.xml');
+  assert.match(rules, /path="backup\/"/);
+  assert.doesNotMatch(rules, /domain="database"|domain="root"/);
+});
+
+test('нижний плеер: блок кнопок привязан к строке трека, а не к центру всей панели', () => {
+  const css = read('www/crimson-theme.css');
+  assert.match(css, /#player:not\(\.player-fullscreen\) \.player-controls \{ top: 10px; bottom: auto; height: 56px; transform: none; \}/);
+  assert.match(css, /\.timeline \{ margin-top: 8px/);
+});
+
+test('интерактивная полоска перемотки сохранена', () => {
+  const html = read('www/index.html');
+  assert.match(html, /<input id="seek" type="range"/);
 });

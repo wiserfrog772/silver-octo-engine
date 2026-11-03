@@ -1,4 +1,25 @@
 /** IndexedDB access kept outside the app/UI module so persistence can be tested independently. */
+
+/** Индексы хранилища треков. Добавляются миграцией; уже сохранённые записи не затрагиваются. */
+export const LIBRARY_INDEXES = [
+  { name: 'sourceId', keyPath: 'sourceId' },
+  { name: 'youtubeId', keyPath: 'youtubeId' },
+  { name: 'addedAt', keyPath: 'addedAt' }
+];
+
+/** Миграция схемы: версия 1 — только хранилище; версия 2 — индексы. Данные никогда не удаляются. */
+export function upgradeLibraryStore(db, transaction, oldVersion, storeName) {
+  const store = db.objectStoreNames.contains(storeName)
+    ? transaction.objectStore(storeName)
+    : db.createObjectStore(storeName, { keyPath: 'id' });
+  if (oldVersion < 2) {
+    for (const index of LIBRARY_INDEXES) {
+      if (!store.indexNames.contains(index.name)) store.createIndex(index.name, index.keyPath, { unique: false });
+    }
+  }
+  return store;
+}
+
 export function createLibraryStore({ databaseName, version, storeName, indexedDBApi = globalThis.indexedDB }) {
   function open() {
     return new Promise((resolve, reject) => {
@@ -7,9 +28,8 @@ export function createLibraryStore({ databaseName, version, storeName, indexedDB
         return;
       }
       const request = indexedDBApi.open(databaseName, version);
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains(storeName)) db.createObjectStore(storeName, { keyPath: 'id' });
+      request.onupgradeneeded = (event) => {
+        upgradeLibraryStore(request.result, request.transaction, event && event.oldVersion || 0, storeName);
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error || new Error('Не удалось открыть медиатеку.'));
@@ -48,7 +68,7 @@ export function createLibraryStore({ databaseName, version, storeName, indexedDB
     });
   }
 
-  return { open, getAll, putMany, removeMany };
+  return { open, getAll, putMany, removeMany, close: (db) => { try { db && db.close(); } catch (_) {} } };
 }
 
 export function migratePreferenceKeys(storage, currentKeys, legacyKeys) {

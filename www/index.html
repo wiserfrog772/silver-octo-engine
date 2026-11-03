@@ -26,13 +26,22 @@
       <section id="librarySection" class="library-section">
         <div class="section-heading library-heading">
           <div><div class="eyebrow">ТВОЯ КОЛЛЕКЦИЯ</div><h2 id="sectionTitle">Моя музыка</h2></div>
-          <div class="library-heading-actions"><div class="track-count" id="trackCount">0 треков</div><select id="sortSelect" class="sort-select" aria-label="Порядок сортировки медиатеки"><option value="recent">Сначала новые</option><option value="title">По названию</option><option value="artist">По исполнителю</option></select><button id="queueFromCurrent" class="secondary-button queue-current-button" type="button">В очередь от текущего</button></div>
+          <div class="library-heading-actions"><div class="track-count" id="trackCount">0 треков</div><button id="queueFromCurrent" class="secondary-button queue-current-button" type="button">В очередь от текущего</button></div>
         </div>
         <label class="search-box" for="searchInput">
           <svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4 4"/></svg>
           <input id="searchInput" type="search" placeholder="Найти трек или исполнителя" autocomplete="off">
           <kbd>⌕</kbd>
         </label>
+        <div class="filter-toolbar">
+          <div id="filterBar" class="filter-bar" role="radiogroup" aria-label="Порядок сортировки медиатеки">
+            <button type="button" role="radio" data-sort="recent" class="filter-segment">Новые</button>
+            <button type="button" role="radio" data-sort="title" class="filter-segment">Название</button>
+            <button type="button" role="radio" data-sort="artist" class="filter-segment">Исполнитель</button>
+          </div>
+          <div id="activeFilters" class="active-filters" aria-live="polite"></div>
+        </div>
+        <div class="scan-panel hidden" role="status" aria-live="polite"><div class="scan-head"><strong class="scan-message"></strong><button type="button" class="scan-cancel secondary-button hidden">Отмена</button></div><div class="scan-bar"><span></span></div><div class="scan-counters"></div><div class="scan-file"></div></div>
         <div id="trackList" class="track-list" aria-live="polite"></div>
       </section>
 
@@ -58,6 +67,20 @@
           <div class="settings-actions">
             <button id="chooseLibraryFolder" type="button" class="primary-button">Выбрать папку</button>
             <button id="refreshLibraryFolder" type="button" class="secondary-button">Пересканировать</button>
+          </div>
+          <div class="scan-panel hidden" role="status" aria-live="polite"><div class="scan-head"><strong class="scan-message"></strong><button type="button" class="scan-cancel secondary-button hidden">Отмена</button></div><div class="scan-bar"><span></span></div><div class="scan-counters"></div><div class="scan-file"></div></div>
+        </article>
+        <article class="settings-card">
+          <div class="settings-card-title"><span class="settings-symbol">⛨</span><div><h3>Данные и резервные копии</h3><p>Плейлисты, порядок треков и настройки хранятся вне библиотеки и копируются автоматически. После переустановки они восстанавливаются сами, а треки сопоставляются по названию и исполнителю после сканирования папки.</p></div></div>
+          <div id="dataStatus" class="settings-status">Резервная копия создаётся автоматически после изменений.</div>
+          <div class="settings-actions">
+            <button id="backupNow" type="button" class="primary-button">Создать копию сейчас</button>
+            <button id="restoreBackup" type="button" class="secondary-button">Восстановить из копии</button>
+            <button id="restoreBackupFile" type="button" class="secondary-button">Восстановить из файла…</button>
+            <button id="exportPlaylists" type="button" class="secondary-button">Экспорт плейлистов</button>
+            <button id="importPlaylists" type="button" class="secondary-button">Импорт плейлистов</button>
+            <button id="checkIntegrity" type="button" class="secondary-button">Проверить целостность</button>
+            <button id="wipeData" type="button" class="danger-button">Удалить все данные…</button>
           </div>
         </article>
         <article class="settings-card">

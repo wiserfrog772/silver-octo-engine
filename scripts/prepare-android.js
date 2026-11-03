@@ -77,6 +77,18 @@ function patchManifest() {
   if (!text.includes('androidx.media3.session.MediaButtonReceiver')) {
     text = text.replace('</application>', '        <receiver android:name="androidx.media3.session.MediaButtonReceiver" android:enabled="true" android:exported="true"><intent-filter><action android:name="android.intent.action.MEDIA_BUTTON" /></intent-filter></receiver>\n    </application>');
   }
+  // Сохранность данных: Auto Backup только для папки backup/, а при удалении приложения Android
+  // (10+) спрашивает, сохранить ли данные (hasFragileUserData). Подробности в docs/DATA-PERSISTENCE.md.
+  for (const [name, value] of [
+    ['android:allowBackup', 'true'],
+    ['android:fullBackupContent', '@xml/crimson_backup_rules'],
+    ['android:dataExtractionRules', '@xml/crimson_data_extraction_rules'],
+    ['android:hasFragileUserData', 'true']
+  ]) {
+    const attribute = new RegExp(name.replace(':', ':') + '="[^"]*"');
+    if (attribute.test(text)) text = text.replace(attribute, name + '="' + value + '"');
+    else text = text.replace(/<application\b/, '<application ' + name + '="' + value + '"');
+  }
   if (/android:extractNativeLibs=/.test(text)) {
     text = text.replace(/android:extractNativeLibs="[^"]*"/, 'android:extractNativeLibs="true"');
   } else {
@@ -92,10 +104,17 @@ function copyNativeFiles() {
   const drawableTargetRoot = path.join(appRoot, 'src', 'main', 'res', 'drawable-nodpi');
   fs.mkdirSync(javaTargetRoot, { recursive: true });
   fs.mkdirSync(drawableTargetRoot, { recursive: true });
-  for (const name of ['MainActivity.java', 'YtDlpPlugin.java', 'PlaybackNotificationPlugin.java', 'PlaybackActionReceiver.java', 'PlaybackForegroundService.java']) {
+  for (const name of ['MainActivity.java', 'YtDlpPlugin.java', 'PlaybackNotificationPlugin.java', 'PlaybackActionReceiver.java', 'PlaybackForegroundService.java', 'BackupStore.java']) {
     const src = path.join(javaSourceRoot, name);
     requireFile(src, 'Не найден исходник native plugin');
     fs.copyFileSync(src, path.join(javaTargetRoot, name));
+  }
+  const xmlSourceRoot = path.join(nativeSourceRoot, 'res', 'xml');
+  const xmlTargetRoot = path.join(appRoot, 'src', 'main', 'res', 'xml');
+  fs.mkdirSync(xmlTargetRoot, { recursive: true });
+  for (const name of ['crimson_backup_rules.xml', 'crimson_data_extraction_rules.xml']) {
+    requireFile(path.join(xmlSourceRoot, name), 'Не найдены правила резервного копирования');
+    fs.copyFileSync(path.join(xmlSourceRoot, name), path.join(xmlTargetRoot, name));
   }
   const icon = path.join(drawableSourceRoot, 'crimson_icon.png');
   requireFile(icon, 'Не найдена иконка Crimson');
