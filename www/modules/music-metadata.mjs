@@ -49,8 +49,23 @@ function cleanTechnicalSuffix(value) {
 }
 
 /** Clean only known promotional/technical noise; retain meaningful track versions. */
+/**
+ * Служебная пометка автоматических каналов YouTube Music «Artist - Topic». Убираем только отдельный сегмент
+ * между разделителями или в скобках; слово внутри настоящего названия («Hot Topic») не трогаем.
+ */
+export function stripTopicMarker(value) {
+  const text = normalizeText(value);
+  const cleaned = text
+    .replace(/\s*[([]\s*Topic\s*[)\]]/gi, '')
+    .replace(/\s+[-–—|•·]\s*Topic(?=\s+[-–—|•·]\s+|\s*$)/gi, '')
+    .replace(/^Topic\s+[-–—|•·]\s+(?=\S)/i, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return /[\p{L}\p{N}]/u.test(cleaned) ? cleaned : text;
+}
+
 export function cleanTrackTitle(value, videoId = '') {
-  let title = normalizeText(value);
+  let title = stripTopicMarker(value);
   const id = normalizeText(videoId);
   if (!title) return '';
   if (/^[A-Za-z0-9_-]{11}$/.test(id)) {
@@ -77,7 +92,7 @@ export function cleanTrackTitle(value, videoId = '') {
 
 /** Remove channel suffixes without stripping legitimate artist names. */
 export function cleanArtistName(value) {
-  let artist = normalizeText(value);
+  let artist = stripTopicMarker(value);
   if (!artist) return '';
   artist = artist
     .replace(/\s*[-–—|•·]\s*Topic\s*$/i, '')

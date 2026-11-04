@@ -44,6 +44,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Locale;
+import java.util.Collections;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -426,18 +432,308 @@ public class YtDlpPlugin extends Plugin {
     }
 
 
+
+    // ===== Управление загрузками: жёсткий предел параллелизма, отмена, разбор прогресса yt-dlp =====
+    // JS-очередь ограничивает число одновременных скачиваний (по умолчанию 2); этот предел — защита на случай ошибки.
+    private static final int MAX_PARALLEL_DOWNLOADS = 4;
+    private static final long PROGRESS_EMIT_INTERVAL_MS = 200L;
+    private static final long INFO_FILE_MAX_AGE_MS = 20L * 60L * 1000L;
+    private final Semaphore downloadPermits = new Semaphore(MAX_PARALLEL_DOWNLOADS);
+    private final ConcurrentHashMap<String, String> activeProcesses = new ConcurrentHashMap<>();
+    private final Set<String> cancelledDownloads = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+    private static final Pattern DOWNLOAD_LINE = Pattern.compile(
+        "\\[download\\]\\s+([\\d.]+)%\\s+of\\s+~?\\s*([\\d.]+)\\s*([KMG]?i?B)(?:\\s+at\\s+([\\d.]+)\\s*([KMG]?i?B)/s)?");
+
+    private static double unitToBytes(double value, String unit) {
+        String u = unit == null ? "" : unit.toUpperCase(Locale.ROOT);
+        if (u.startsWith("K")) return value * 1024d;
+        if (u.startsWith("M")) return value * 1024d * 1024d;
+        if (u.startsWith("G")) return value * 1024d * 1024d * 1024d;
+        return value;
+    }
+
+    private static String phaseFromLine(String line, String previous) {
+        String text = line == null ? "" : line;
+        if (text.contains("[ExtractAudio]")) return "converting";
+        if (text.contains("[Metadata]") || text.contains("[FixupM4a]") || text.contains("[FixupM3u8]")) return "metadata";
+        if (text.contains("[EmbedThumbnail]") || text.contains("[ThumbnailsConvertor]") || text.contains("thumbnail")) return "thumbnail";
+        if (text.contains("[download]")) return "downloading";
+        if (text.startsWith("[youtube") || text.startsWith("[info]")) return "extracting";
+        return previous;
+    }
+
+    /** Ошибки отсутствия сети: перебирать остальные стратегии бессмысленно, они упадут так же и каждая будет ждать тайм-аут. */
+    private static boolean isOfflineFailure(String message) {
+        String lower = message == null ? "" : message.toLowerCase(Locale.ROOT);
+        return lower.contains("temporary failure in name resolution") || lower.contains("network is unreachable")
+            || lower.contains("unable to resolve host") || lower.contains("no address associated with hostname")
+            || lower.contains("failed to resolve") || lower.contains("no route to host");
+    }
+
+    @PluginMethod
+    public void cancelDownload(PluginCall call) {
+        String id = cleanFilePart(safe(call.getString("id")));
+        if (id.isEmpty()) { call.reject("Не указан идентификатор загрузки."); return; }
+        cancelledDownloads.add(id);
+        String processId = activeProcesses.get(id);
+        if (processId != null) {
+            try { YoutubeDL.getInstance().destroyProcessById(processId); } catch (Exception ex) { Log.w(TAG, "Could not destroy process " + processId, ex); }
+        }
+        call.resolve();
+    }
+
+
+    // ===== Плейлисты как папки: «Crimson Playlists/<название>/» с музыкой и манифестом =====
+    private static final String PLAYLISTS_DIR = "Crimson Playlists";
+    private static final String PLAYLIST_MANIFEST = "crimson-playlist.json";
+
+    /** Корневая папка плейлистов внутри выбранной пользователем папки (медиатека, затем загрузки). */
+    private DocumentFile playlistsRoot(boolean create) {
+        for (String key : new String[] {LIBRARY_TREE_URI, DOWNLOAD_TREE_URI}) {
+            String tree = storagePrefs().getString(key, "");
+            if (tree == null || tree.isEmpty()) continue;
+            try {
+                DocumentFile root = DocumentFile.fromTreeUri(getContext(), Uri.parse(tree));
+                if (root == null || !root.isDirectory() || !root.canWrite()) continue;
+                DocumentFile dir = root.findFile(PLAYLISTS_DIR);
+                if ((dir == null || !dir.isDirectory()) && create) dir = root.createDirectory(PLAYLISTS_DIR);
+                if (dir != null && dir.isDirectory()) return dir;
+            } catch (Exception ignored) { /* пробуем следующую папку */ }
+        }
+        return null;
+    }
+
+    private static String mimeForAudioName(String name) {
+        String lower = name == null ? "" : name.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".mp3")) return "audio/mpeg";
+        if (lower.endsWith(".m4a") || lower.endsWith(".mp4") || lower.endsWith(".aac")) return "audio/mp4";
+        if (lower.endsWith(".ogg") || lower.endsWith(".oga") || lower.endsWith(".opus")) return "audio/ogg";
+        if (lower.endsWith(".flac")) return "audio/flac";
+        if (lower.endsWith(".wav")) return "audio/wav";
+        if (lower.endsWith(".webm")) return "audio/webm";
+        return "application/octet-stream";
+    }
+
+    private Set<String> readManagedNames(DocumentFile dir) {
+        Set<String> managed = new java.util.LinkedHashSet<>();
+        try {
+            DocumentFile manifest = dir.findFile(PLAYLIST_MANIFEST);
+            if (manifest == null) return managed;
+            try (java.io.InputStream in = getContext().getContentResolver().openInputStream(manifest.getUri())) {
+                if (in == null) return managed;
+                JSONArray names = new JSONObject(BackupStore.readAll(in)).optJSONArray("managed");
+                if (names != null) for (int i = 0; i < names.length(); i++) managed.add(names.getString(i));
+            }
+        } catch (Exception ignored) { /* нет манифеста — ничего не считаем нашим */ }
+        return managed;
+    }
+
+    private void writeDocumentText(DocumentFile dir, String name, String text) throws Exception {
+        DocumentFile file = dir.findFile(name);
+        if (file == null) file = dir.createFile("application/json", name);
+        if (file == null) throw new IllegalStateException("Не удалось создать " + name);
+        try (OutputStream out = getContext().getContentResolver().openOutputStream(file.getUri(), "wt")) {
+            if (out == null) throw new IllegalStateException("Файл недоступен для записи.");
+            out.write(text.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    private void copyLocalFileToDocument(File source, DocumentFile target) throws Exception {
+        try (java.io.InputStream in = new java.io.FileInputStream(source);
+             OutputStream out = getContext().getContentResolver().openOutputStream(target.getUri(), "w")) {
+            if (out == null) throw new IllegalStateException("Не удалось открыть файл для записи.");
+            byte[] buffer = new byte[64 * 1024];
+            int count;
+            while ((count = in.read(buffer)) != -1) out.write(buffer, 0, count);
+        }
+    }
+
+    /**
+     * Создаёт/обновляет папку плейлиста: копирует недостающие треки, удаляет из папки только те файлы,
+     * которые Crimson скопировал сам (список managed в манифесте), и записывает манифест с порядком.
+     */
+    @PluginMethod
+    public void syncPlaylistFolder(PluginCall call) {
+        final String folderName = safe(call.getString("folderName"));
+        final String previousName = safe(call.getString("previousName"));
+        final String manifestText = safe(call.getString("manifest"));
+        final JSArray files = call.getArray("files");
+        if (folderName.isEmpty() || manifestText.isEmpty()) { call.reject("Недостаточно данных плейлиста."); return; }
+        executor.execute(() -> {
+            try {
+                DocumentFile root = playlistsRoot(true);
+                if (root == null) { call.reject("Выбери папку с музыкой или загрузок в настройках: в ней появится «" + PLAYLISTS_DIR + "»."); return; }
+                if (!previousName.isEmpty() && !previousName.equals(folderName)) {
+                    DocumentFile old = root.findFile(previousName);
+                    if (old != null && old.isDirectory() && root.findFile(folderName) == null) old.renameTo(folderName);
+                }
+                DocumentFile dir = root.findFile(folderName);
+                if (dir == null || !dir.isDirectory()) dir = root.createDirectory(folderName);
+                if (dir == null) throw new IllegalStateException("Не удалось создать папку плейлиста.");
+                Set<String> managed = readManagedNames(dir);
+                Set<String> wanted = new java.util.LinkedHashSet<>();
+                int copied = 0;
+                if (files != null) {
+                    for (int i = 0; i < files.length(); i++) {
+                        JSONObject item = files.getJSONObject(i);
+                        String name = item.optString("fileName", "");
+                        File source = new File(item.optString("path", ""));
+                        if (name.isEmpty()) continue;
+                        wanted.add(name);
+                        if (dir.findFile(name) != null) continue;           // уже лежит в папке
+                        if (!source.isFile()) continue;                      // исходник недоступен — пропускаем, трек останется в манифесте
+                        DocumentFile target = dir.createFile(mimeForAudioName(name), name);
+                        if (target == null) continue;
+                        try { copyLocalFileToDocument(source, target); managed.add(name); copied++; }
+                        catch (Exception copyError) { target.delete(); Log.w(TAG, "Playlist copy failed: " + name, copyError); }
+                    }
+                }
+                for (String name : new ArrayList<>(managed)) {
+                    if (wanted.contains(name)) continue;
+                    DocumentFile stale = dir.findFile(name);
+                    if (stale != null) stale.delete();
+                    managed.remove(name);
+                }
+                JSONObject manifest = new JSONObject(manifestText);
+                manifest.put("managed", new JSONArray(managed));
+                writeDocumentText(dir, PLAYLIST_MANIFEST, manifest.toString());
+                JSObject result = new JSObject();
+                result.put("copied", copied);
+                call.resolve(result);
+            } catch (Exception ex) {
+                call.reject("Не удалось сохранить плейлист в папку: " + safeMessage(ex));
+            }
+        });
+    }
+
+    /** Удаляет манифест и скопированные Crimson файлы; чужие файлы в папке не трогаются. */
+    private void deletePlaylistDirectory(DocumentFile dir) {
+        Set<String> managed = readManagedNames(dir);
+        for (String name : managed) {
+            DocumentFile file = dir.findFile(name);
+            if (file != null) file.delete();
+        }
+        DocumentFile manifest = dir.findFile(PLAYLIST_MANIFEST);
+        if (manifest != null) manifest.delete();
+        DocumentFile[] rest = dir.listFiles();
+        if (rest == null || rest.length == 0) dir.delete();
+    }
+
+    @PluginMethod
+    public void deletePlaylistFolder(PluginCall call) {
+        final String folderName = safe(call.getString("folderName"));
+        executor.execute(() -> {
+            try {
+                DocumentFile root = playlistsRoot(false);
+                DocumentFile dir = root == null || folderName.isEmpty() ? null : root.findFile(folderName);
+                if (dir != null && dir.isDirectory()) deletePlaylistDirectory(dir);
+                call.resolve();
+            } catch (Exception ex) {
+                call.reject("Не удалось удалить папку плейлиста: " + safeMessage(ex));
+            }
+        });
+    }
+
+    @PluginMethod
+    public void deleteAllPlaylistFolders(PluginCall call) {
+        executor.execute(() -> {
+            try {
+                DocumentFile root = playlistsRoot(false);
+                if (root != null) {
+                    for (DocumentFile child : root.listFiles()) if (child.isDirectory()) deletePlaylistDirectory(child);
+                    DocumentFile[] rest = root.listFiles();
+                    if (rest == null || rest.length == 0) root.delete();
+                }
+                call.resolve();
+            } catch (Exception ex) {
+                call.reject("Не удалось удалить папки плейлистов: " + safeMessage(ex));
+            }
+        });
+    }
+
+    /** Папки плейлистов с манифестами и списком аудиофайлов: для восстановления после переустановки. */
+    @PluginMethod
+    public void readPlaylistFolders(PluginCall call) {
+        executor.execute(() -> {
+            JSArray folders = new JSArray();
+            try {
+                DocumentFile root = playlistsRoot(false);
+                if (root != null) {
+                    for (DocumentFile dir : root.listFiles()) {
+                        if (dir == null || !dir.isDirectory()) continue;
+                        DocumentFile manifest = dir.findFile(PLAYLIST_MANIFEST);
+                        if (manifest == null) continue;
+                        String text;
+                        try (java.io.InputStream in = getContext().getContentResolver().openInputStream(manifest.getUri())) {
+                            text = in == null ? "" : BackupStore.readAll(in);
+                        } catch (Exception unreadable) { continue; }
+                        JSArray audio = new JSArray();
+                        for (DocumentFile file : dir.listFiles()) {
+                            if (file == null || !file.isFile() || !isAudioDocument(file)) continue;
+                            JSObject item = new JSObject();
+                            item.put("name", file.getName());
+                            item.put("sourceId", file.getUri().toString());
+                            item.put("size", file.length());
+                            item.put("lastModified", file.lastModified());
+                            audio.put(item);
+                        }
+                        JSObject entry = new JSObject();
+                        entry.put("dirName", dir.getName());
+                        entry.put("manifest", text);
+                        entry.put("files", audio);
+                        folders.put(entry);
+                    }
+                }
+            } catch (Exception ex) {
+                Log.w(TAG, "readPlaylistFolders failed", ex);
+            }
+            JSObject result = new JSObject();
+            result.put("folders", folders);
+            call.resolve(result);
+        });
+    }
+
+    /** Файлы из папок плейлистов, которых нет в библиотеке: готовим их так же, как при сканировании. */
+    @PluginMethod
+    public void ingestPlaylistFiles(PluginCall call) {
+        final JSArray sources = call.getArray("sourceIds");
+        executor.execute(() -> {
+            JSArray rows = new JSArray();
+            try {
+                for (int i = 0; sources != null && i < sources.length(); i++) {
+                    String sourceUri = sources.getString(i);
+                    try {
+                        DocumentFile document = DocumentFile.fromSingleUri(getContext(), Uri.parse(sourceUri));
+                        if (document == null || !document.isFile()) continue;
+                        File localFile = cacheLibraryDocument(document);
+                        JSObject row = new JSObject();
+                        row.put("sourceId", sourceUri);
+                        row.put("name", document.getName() == null ? "audio" : document.getName());
+                        row.put("path", localFile.getAbsolutePath());
+                        row.put("size", localFile.length());
+                        row.put("duration", readAudioDurationSeconds(localFile));
+                        row.put("lastModified", document.lastModified());
+                        String coverPath = cacheEmbeddedCover(localFile, sourceUri);
+                        if (!coverPath.isEmpty()) row.put("coverPath", coverPath);
+                        rows.put(row);
+                    } catch (Exception skip) { Log.w(TAG, "Ingest skipped " + sourceUri, skip); }
+                }
+            } finally {
+                JSObject result = new JSObject();
+                result.put("rows", rows);
+                call.resolve(result);
+            }
+        });
+    }
+
     // ===== Резервные копии пользовательских данных =====
     @PluginMethod
     public void saveBackup(PluginCall call) {
         final String json = call.getString("json", "");
         executor.execute(() -> {
             try {
-                BackupStore.save(getContext(), json);
-                boolean mirrored = BackupStore.mirror(getContext(), storagePrefs().getString(LIBRARY_TREE_URI, ""), json);
-                mirrored = BackupStore.mirror(getContext(), storagePrefs().getString(DOWNLOAD_TREE_URI, ""), json) || mirrored;
-                JSObject result = new JSObject();
-                result.put("mirrored", mirrored);
-                call.resolve(result);
+                BackupStore.save(getContext(), json);   // только приватная копия; плейлисты с музыкой лежат в папках «Crimson Playlists»
+                call.resolve(new JSObject());
             } catch (Exception ex) {
                 call.reject("Не удалось сохранить резервную копию: " + safeMessage(ex));
             }
@@ -448,8 +744,7 @@ public class YtDlpPlugin extends Plugin {
     public void readBackups(PluginCall call) {
         executor.execute(() -> {
             JSArray backups = new JSArray();
-            for (String[] item : BackupStore.readAllCandidates(getContext(),
-                    storagePrefs().getString(LIBRARY_TREE_URI, ""), storagePrefs().getString(DOWNLOAD_TREE_URI, ""))) {
+            for (String[] item : BackupStore.readAllCandidates(getContext(), "", "")) {
                 JSObject entry = new JSObject();
                 entry.put("source", item[0]);
                 entry.put("text", item[1]);
@@ -538,6 +833,13 @@ public class YtDlpPlugin extends Plugin {
                 JSONObject info = identityFields(metadata);
                 JSObject result = new JSObject();
                 result.put("info", info);
+                // Полный ответ сохраняем, чтобы скачивание не извлекало информацию о видео повторно.
+                String videoId = cleanFilePart(info.optString("id", ""));
+                if (!videoId.isEmpty() && metadata.has("formats")) {
+                    File infoFile = new File(getContext().getCacheDir(), "info-" + videoId + ".json");
+                    try { BackupStore.writeAtomic(infoFile, metadata.toString()); result.put("infoFile", infoFile.getAbsolutePath()); }
+                    catch (Exception ignored) { /* необязательно: скачивание извлечёт информацию само */ }
+                }
                 call.resolve(result);
             } catch (Exception ex) {
                 call.reject("Не удалось получить метаданные: " + safeMessage(ex));
@@ -600,7 +902,12 @@ public class YtDlpPlugin extends Plugin {
         for (DocumentFile child : children) {
             if (scanCancelled.get()) return;
             if (child == null) continue;
-            if (child.isDirectory()) collectAudioDocuments(child, output);
+            if (child.isDirectory()) {
+                // Папки плейлистов содержат копии треков: в библиотеку они не добавляются, чтобы не было дубликатов
+                // и чтобы удаление плейлиста не могло затронуть файл, на который ссылается библиотека.
+                if (PLAYLISTS_DIR.equals(child.getName())) continue;
+                collectAudioDocuments(child, output);
+            }
             else if (child.isFile() && isAudioDocument(child)) output.add(child);
         }
     }
@@ -983,8 +1290,13 @@ public class YtDlpPlugin extends Plugin {
             return;
         }
 
+        final String infoFilePath = safe(call.getString("infoFile"));
         executor.execute(() -> {
+            boolean permitAcquired = false;
             try {
+                downloadPermits.acquire();
+                permitAcquired = true;
+                if (cancelledDownloads.remove(id)) throw new IllegalStateException("Загрузка отменена.");
                 ensureReady();
                 File outputDir = musicOutputDirectory();
                 // Если JS уже определил исполнителя и название (единый механизм track-identity), используем
@@ -1038,7 +1350,14 @@ public class YtDlpPlugin extends Plugin {
                 StringBuilder failures = new StringBuilder();
                 File downloaded = null;
                 String finalFormatLabel = "";
+                // Сохранённая информация о видео (ответ первого запроса) годна ограниченное время и только для первой стратегии.
+                File infoFile = infoFilePath.isEmpty() ? null : new File(infoFilePath);
+                boolean infoUsable = infoFile != null && infoFile.isFile() && infoFile.getParentFile() != null
+                    && getContext().getCacheDir().equals(infoFile.getParentFile())
+                    && System.currentTimeMillis() - infoFile.lastModified() < INFO_FILE_MAX_AGE_MS;
                 for (int attempt = 0; attempt < strategies.length; attempt++) {
+                    if (cancelledDownloads.contains(id)) break;
+                    final boolean useInfoFile = infoUsable && attempt == 0;
                     String[] strategy = strategies[attempt];
                     String label = strategy[0];
                     String outputKey = id + "-" + strategy[1];
@@ -1061,10 +1380,16 @@ public class YtDlpPlugin extends Plugin {
                                 .addOption("--retries", "3")
                                 .addOption("--extractor-retries", "3")
                                 .addOption("--fragment-retries", "3")
+                                .addOption("--socket-timeout", "20")
+                                // Параллельная загрузка фрагментов одного трека (для DASH/HLS); не связана с числом одновременных треков.
+                                .addOption("--concurrent-fragments", "4")
+                                // Если YouTube занижает скорость потока, yt-dlp заново получит ссылку вместо долгой загрузки.
+                                .addOption("--throttled-rate", "100K")
                                 .addOption("-f", strategy[2])
                                 .addOption("--embed-metadata")
                                 .addOption("--embed-thumbnail")
                                 .addOption("-o", new File(outputDir, outputKey + ".%(ext)s").getAbsolutePath());
+                            if (useInfoFile) request.addOption("--load-info-json", infoFile.getAbsolutePath());
                             if (resolved) {
                                 // Теги пишем из единого механизма: Title без исполнителя, Artist отдельно.
                                 addResolvedTags(request, title, artist, album, year, genre);
@@ -1078,19 +1403,42 @@ public class YtDlpPlugin extends Plugin {
                                     .addOption("--audio-quality", "0");
                             }
                             String processId = "crimson-download-" + id + "-" + strategy[1] + "-" + System.nanoTime();
+                            activeProcesses.put(id, processId);
+                            final String[] lastPhase = new String[] {"extracting"};
+                            final long[] lastEmit = new long[] {0L};
                             Function3<Float, Long, String, Unit> callback = new Function3<Float, Long, String, Unit>() {
                                 @Override
                                 public Unit invoke(Float progress, Long etaInSeconds, String line) {
+                                    String phase = phaseFromLine(line, lastPhase[0]);
+                                    boolean phaseChanged = !phase.equals(lastPhase[0]);
+                                    lastPhase[0] = phase;
+                                    long now = System.currentTimeMillis();
+                                    // Не чаще ~5 раз в секунду: иначе интерфейс тратит время на обработку событий.
+                                    if (!phaseChanged && now - lastEmit[0] < PROGRESS_EMIT_INTERVAL_MS) return Unit.INSTANCE;
+                                    lastEmit[0] = now;
                                     JSObject update = new JSObject();
                                     update.put("id", id);
                                     update.put("progress", Math.max(0, Math.min(100, progress == null ? 0 : progress)));
                                     update.put("eta", etaInSeconds == null ? 0 : etaInSeconds);
                                     update.put("format", label);
+                                    update.put("phase", phase);
+                                    Matcher matcher = line == null ? null : DOWNLOAD_LINE.matcher(line);
+                                    if (matcher != null && matcher.find()) {
+                                        try {
+                                            double total = unitToBytes(Double.parseDouble(matcher.group(2)), matcher.group(3));
+                                            double percent = Double.parseDouble(matcher.group(1));
+                                            update.put("total", (long) total);
+                                            update.put("downloaded", (long) (total * percent / 100d));
+                                            if (matcher.group(4) != null) update.put("speed", (long) unitToBytes(Double.parseDouble(matcher.group(4)), matcher.group(5)));
+                                        } catch (NumberFormatException ignored) { /* строка нестандартная: остаётся процент */ }
+                                    }
                                     notifyListeners("downloadProgress", update);
                                     return Unit.INSTANCE;
                                 }
                             };
-                            YoutubeDLResponse response = YoutubeDL.getInstance().execute(request, processId, callback);
+                            YoutubeDLResponse response;
+                            try { response = YoutubeDL.getInstance().execute(request, processId, callback); }
+                            finally { activeProcesses.remove(id); }
                             if (response.getExitCode() != 0) {
                                 String diagnostic = fallback(response.getErr(), response.getOut());
                                 throw new IllegalStateException("yt-dlp exit " + response.getExitCode() + ": " + diagnostic);
@@ -1100,6 +1448,15 @@ public class YtDlpPlugin extends Plugin {
                         } catch (Exception attemptError) {
                             Log.e(TAG, "Download attempt failed [" + label + "]", attemptError);
                             cleanupDownloadAttempt(outputDir, outputKey);
+                            if (cancelledDownloads.contains(id)) break;
+                            // Сохранённая информация могла устареть: повторяем ту же стратегию обычным способом.
+                            if (useInfoFile && !isOfflineFailure(safeMessage(attemptError))) { infoUsable = false; attempt--; continue; }
+                            // Нет сети: остальные стратегии упадут так же, не тратим время на их тайм-ауты.
+                            if (isOfflineFailure(safeMessage(attemptError))) {
+                                if (failures.length() > 0) failures.append(" | ");
+                                failures.append(label).append(": ").append(safeMessage(attemptError));
+                                break;
+                            }
                             if (failures.length() > 0) failures.append(" | ");
                             failures.append(label).append(": ").append(safeMessage(attemptError));
                             String message = friendlyDownloadFailure(failures.toString());
@@ -1125,11 +1482,11 @@ public class YtDlpPlugin extends Plugin {
                     break;
                 }
 
+                if (cancelledDownloads.contains(id)) throw new IllegalStateException("Загрузка отменена.");
                 if (downloaded == null) {
                     Log.e(TAG, "All download strategies failed for video " + id + ": " + failures);
                     throw new IllegalStateException(friendlyDownloadFailure(failures.toString()));
                 }
-                publishDownload(downloaded, artist, title, id, resolved);
                 JSObject result = new JSObject();
                 result.put("path", downloaded.getAbsolutePath());
                 result.put("title", title);
@@ -1139,12 +1496,27 @@ public class YtDlpPlugin extends Plugin {
                 result.put("genre", genre);
                 result.put("size", downloaded.length());
                 result.put("format", actualAudioFormat(downloaded, finalFormatLabel));
-                call.resolve(result);
+                call.resolve(result);   // трек готов: запись в библиотеку не ждёт копирования во внешнюю папку
+                try {
+                    publishDownload(downloaded, artist, title, id, resolved);
+                } catch (Exception publishError) {
+                    Log.w(TAG, "Copy to the selected folder failed", publishError);
+                    JSObject published = new JSObject();
+                    published.put("id", id);
+                    published.put("ok", false);
+                    published.put("message", "Трек скачан, но не скопирован в выбранную папку: " + safeMessage(publishError));
+                    notifyListeners("downloadPublished", published);
+                }
             } catch (Exception ex) {
                 Log.e(TAG, "Audio download failed", ex);
                 String message = safeMessage(ex);
+                if (message.startsWith("Загрузка отменена")) { call.reject(message); return; }
                 if (message.startsWith("YouTube отклонил") || message.startsWith("Не удалось обработать") || message.startsWith("Не удалось скачать") || message.startsWith("Файл cookies")) call.reject(message);
                 else call.reject(friendlyDownloadFailure(message));
+            } finally {
+                activeProcesses.remove(id);
+                cancelledDownloads.remove(id);
+                if (permitAcquired) downloadPermits.release();
             }
         });
     }
@@ -1162,6 +1534,9 @@ public class YtDlpPlugin extends Plugin {
         }
         if (lower.contains("requested format is not available") || lower.contains("no video formats") || lower.contains("no valid audio")) {
             return "Не удалось получить аудиопоток. Попробуй проверить или обновить yt-dlp.";
+        }
+        if (isOfflineFailure(lower)) {
+            return "Нет подключения к интернету. Проверь соединение и повтори загрузку.";
         }
         if (lower.contains("timeout") || lower.contains("network") || lower.contains("connection") || lower.contains("unable to download") || lower.contains("temporary failure")) {
             return "Не удалось скачать трек из-за сетевой ошибки. Проверь подключение и попробуй ещё раз.";

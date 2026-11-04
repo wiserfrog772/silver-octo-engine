@@ -243,3 +243,13 @@ test('интерактивная полоска перемотки сохран�
   const html = read('www/index.html');
   assert.match(html, /<input id="seek" type="range"/);
 });
+
+test('анимации: нет анимации layout-свойств, нет content-visibility на строках, нет blur-теней', () => {
+  const css = read('www/crimson-theme.css');
+  const keyframes = [...css.matchAll(/@keyframes\s+[\w-]+\s*\{([\s\S]*?)\}\s*(?=@|\n\.|\n\/\*|\n\n|$)/g)].map((m) => m[0]).join('\n');
+  assert.doesNotMatch(keyframes, /margin-left|(?:^|[^-])width\s*:|(?:^|[^-])left\s*:|(?:^|[^-])top\s*:/);
+  assert.doesNotMatch(css, /\.track-row\s*\{[^}]*content-visibility/);
+  assert.match(css, /\.track-row, \.empty-state \{ box-shadow: none !important; \}/);
+  assert.match(css, /html\.lite-motion/);
+  assert.match(read('www/index.html'), /id="liteMotion"/);
+});

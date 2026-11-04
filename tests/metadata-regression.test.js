@@ -202,3 +202,16 @@ test('очистка: служебные пометки убираются, вс
   assert.equal(c.cleanTrackTitle('HD'), 'HD');
   assert.equal(c.cleanTrackTitle('See You Again (ft. Charlie Puth)'), 'See You Again (ft. Charlie Puth)');
 });
+
+test('«Topic» убирается как служебная пометка, но не из настоящих названий', () => {
+  assert.deepEqual(pair(run({ title: 'Numb - Topic' })), ['', 'Numb']);
+  assert.deepEqual(pair(run({ title: 'Linkin Park - Topic - Numb' })), ['Linkin Park', 'Numb']);
+  assert.deepEqual(pair(run({ title: 'Numb (Topic)' })), ['', 'Numb']);
+  assert.equal(c.cleanArtistName('Linkin Park - Topic'), 'Linkin Park');
+  assert.equal(c.cleanArtistName('Linkin Park (Topic)'), 'Linkin Park');
+  assert.deepEqual(pair(run({ title: 'Artist - Hot Topic' })), ['Artist', 'Hot Topic']);
+  assert.equal(c.cleanArtistName('Hot Topic'), 'Hot Topic');
+  assert.deepEqual(pair(run({ title: 'Topic' })), ['', 'Topic']);
+  assert.deepEqual(pair(run({ title: 'x', info: { artist: 'Real Artist - Topic', track: 'Song' } })), ['Real Artist', 'Song']);
+  assert.deepEqual(Object.values(t.parseLibraryFilename('Linkin Park - Topic - Numb.mp3')), ['Linkin Park', 'Numb']);
+});

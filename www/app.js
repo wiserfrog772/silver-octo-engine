@@ -8,6 +8,9 @@ import { classifyTrackSwipe, resolveSwipePlaylist, seekProgressPercent, swipeVis
 import { buildTrackMetadata, libraryNameFromFilename, stripAudioExtension } from './modules/track-identity.mjs';
 import { createLibraryMatcher, matchBadge, MATCH_LEVEL } from './modules/library-match.mjs';
 import { createSnapshot, encodeBackup, decodeBackup, pickNewestValidBackup, exportPlaylists, importPlaylists, checkPlaylistIntegrity, reconcilePlaylists, updatePlaylistRefs, normalizePlaylist, writeGuarded, readGuarded } from './modules/backup.mjs';
+import { createDownloadQueue, clampConcurrency, DEFAULT_CONCURRENCY } from './modules/download-queue.mjs';
+import { mergeProgress, progressView, createThrottle, ACTIVE_PHASES } from './modules/download-progress.mjs';
+import { planFolderSync, playlistsFromFolders } from './modules/playlist-folders.mjs';
 import { planRepairs, applyRepairs, undoRepairs, describeRepairs } from './modules/metadata-repair.mjs';
 import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, isScanActive, scanSummary, isFolderTrack } from './modules/scan-plan.mjs';
 
@@ -22,6 +25,8 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   const STORE = 'tracks';
   const STORAGE_KEYS = {
     queue: 'crimson.mobile.queue',
+    downloadConcurrency: 'crimson.mobile.download-concurrency',
+    playlistFolders: 'crimson.mobile.playlist-folders',
     playlists: 'crimson.mobile.playlists',
     playbackPlaylist: 'crimson.mobile.playback-playlist',
     quickAddPlaylist: 'crimson.mobile.quick-add-playlist',
@@ -437,6 +442,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     } catch (_) { showToast('Не удалось сохранить плейлисты на устройстве.'); }
     if (state.playlists.length) state.allowEmptyBackup = true;
     scheduleBackup();
+    scheduleFolderSync();
   }
 
   function saveQuickAddPlaylist(playlistId) {
@@ -954,7 +960,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     try {
       const result = await plugin.saveBackup({ json: encodeBackup(buildBackupSnapshot()) });
       state.lastBackupAt = Date.now();
-      state.backupStatus = 'Последняя копия: ' + new Date(state.lastBackupAt).toLocaleString('ru-RU') + (result && result.mirrored ? ' · дубль в папке' : '');
+      state.backupStatus = 'Последняя копия: ' + new Date(state.lastBackupAt).toLocaleString('ru-RU');
       refreshDataStatus();
       return result;
     } catch (error) {
@@ -1082,10 +1088,11 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   }
 
   async function wipeAllUserData() {
-    if (!window.confirm('Удалить ВСЕ данные Crimson: плейлисты, настройки, медиатеку и резервные копии? Это действие нельзя отменить.')) return;
+    if (!window.confirm('Удалить ВСЕ данные Crimson: плейлисты (включая папки «Crimson Playlists» с их копиями треков), настройки, медиатеку и резервные копии? Это действие нельзя отменить.')) return;
     if (!window.confirm('Точно удалить всё? Файлы музыки в выбранных папках останутся нетронутыми.')) return;
     try {
       const plugin = window.CrimsonYtDlp;
+      if (plugin && typeof plugin.deleteAllPlaylistFolders === 'function') await plugin.deleteAllPlaylistFolders();
       if (plugin && typeof plugin.wipeBackups === 'function') await plugin.wipeBackups();
       Object.keys(localStorage).filter((key) => key.startsWith('crimson.mobile.') || key.startsWith('localify.mobile.')).forEach((key) => localStorage.removeItem(key));
       libraryStore.close(state.db); state.db = null;
@@ -1185,6 +1192,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
       state.playbackOrder = libraryOrderIds();
       notifyLibraryChanged({ skipReconcile: true });
       render();
+      setTimeout(() => { void restorePlaylistsFromFolders({ silent: true }); }, 1500);
       setTimeout(() => {
         const damaged = planRepairs(state.tracks).length;
         if (damaged) showToast('Найдено треков с повреждёнными названиями: ' + damaged + '. Настройки → «Исправить названия».');
@@ -2204,6 +2212,26 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   });
 
   $('#chooseLibraryFolder').addEventListener('click', chooseLibraryFolder);
+  // Упрощённые анимации: сохраняются в настройках; включаются автоматически при системной настройке «уменьшить движение».
+  const LITE_MOTION_KEY = 'crimson.mobile.lite-motion';
+  function applyLiteMotion(enabled) { document.documentElement.classList.toggle('lite-motion', Boolean(enabled)); }
+  (function initLiteMotion() {
+    let stored = null;
+    try { stored = localStorage.getItem(LITE_MOTION_KEY); } catch (_) {}
+    const enabled = stored === null ? Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) : stored === '1';
+    applyLiteMotion(enabled);
+    const toggle = $('#liteMotion');
+    toggle.checked = enabled;
+    toggle.addEventListener('change', () => { try { localStorage.setItem(LITE_MOTION_KEY, toggle.checked ? '1' : '0'); } catch (_) {} applyLiteMotion(toggle.checked); });
+  })();
+
+  const concurrencySelect = $('#downloadConcurrency');
+  concurrencySelect.value = String(downloadQueue.concurrency);
+  concurrencySelect.addEventListener('change', () => {
+    const value = clampConcurrency(concurrencySelect.value);
+    try { localStorage.setItem(STORAGE_KEYS.downloadConcurrency, String(value)); } catch (_) {}
+    downloadQueue.setConcurrency(value);
+  });
   document.querySelectorAll('.scan-cancel').forEach((button) => button.addEventListener('click', () => { void cancelLibraryScan(); }));
   $('#exportPlaylists').addEventListener('click', () => { void exportPlaylistsFile(); });
   $('#importPlaylists').addEventListener('click', () => { void importPlaylistsFile(); });
@@ -2211,6 +2239,8 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   $('#restoreBackup').addEventListener('click', () => { void restoreFromBackup(); });
   $('#restoreBackupFile').addEventListener('click', () => { void restoreFromChosenFile(); });
   $('#checkIntegrity').addEventListener('click', () => { void runIntegrityCheck(); });
+  $('#syncPlaylistFolders').addEventListener('click', () => { void syncPlaylistFolders({ force: true }); });
+  $('#restorePlaylistFolders').addEventListener('click', async () => { const n = await restorePlaylistsFromFolders({ silent: false }); if (!n) showToast('Новых плейлистов в папке не найдено.'); });
   $('#repairMetadata').addEventListener('click', () => { void repairLibraryMetadata(); });
   $('#undoMetadataRepair').addEventListener('click', () => { void undoMetadataRepair(); });
   $('#wipeData').addEventListener('click', () => { void wipeAllUserData(); });
@@ -2313,6 +2343,11 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   let suppressTrackClickUntil = 0;
   let suppressTrackClickId = '';
   let trackSwipeGesture = null;
+  function stopSwipeFrame(gesture) {
+    if (!gesture) return;
+    gesture.finished = true;
+    if (gesture.frame) { cancelAnimationFrame(gesture.frame); gesture.frame = 0; }
+  }
 
   function resetTrackSwipeRow(row) {
     if (!row || (!row.classList.contains('track-swipe-active') && !row.style.getPropertyValue('--swipe-offset'))) return;
@@ -2374,7 +2409,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     const dy = event.clientY - gesture.startY;
     const direction = classifyTrackSwipe(dx, dy);
     if (direction === 'vertical' || direction === 'left') {
-      trackSwipeGesture = null;
+      trackSwipeGesture = null; stopSwipeFrame(gesture);
       resetTrackSwipeRow(gesture.row);
       return;
     }
@@ -2384,18 +2419,27 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
       const visual = swipeVisual(dx);
       const wasArmed = gesture.armed;
       gesture.armed = visual.armed;
-      gesture.row.classList.add('track-swipe-active');
-      gesture.row.classList.toggle('track-swipe-ready', visual.armed);
-      gesture.row.style.setProperty('--swipe-offset', visual.offset + 'px');
-      gesture.row.style.setProperty('--swipe-progress', String(visual.progress));
       if (visual.armed && !wasArmed && navigator.vibrate) { try { navigator.vibrate(10); } catch (_) {} }
+      // Стили записываются не чаще одного раза за кадр, а не при каждом pointermove (их приходит больше, чем кадров).
+      gesture.pendingVisual = visual;
+      if (!gesture.frame) {
+        gesture.frame = requestAnimationFrame(() => {
+          gesture.frame = 0;
+          const v = gesture.pendingVisual;
+          if (!v || gesture.finished) return;
+          gesture.row.classList.add('track-swipe-active');
+          gesture.row.classList.toggle('track-swipe-ready', v.armed);
+          gesture.row.style.setProperty('--swipe-offset', v.offset + 'px');
+          gesture.row.style.setProperty('--swipe-progress', String(v.progress));
+        });
+      }
     }
   }, { passive: false });
 
   document.addEventListener('pointerup', (event) => {
     const gesture = trackSwipeGesture;
     if (!gesture || gesture.pointerId !== event.pointerId) return;
-    trackSwipeGesture = null;
+    trackSwipeGesture = null; stopSwipeFrame(gesture);
     const dx = event.clientX - gesture.startX;
     const dy = event.clientY - gesture.startY;
     const committed = classifyTrackSwipe(dx, dy) === 'commit';
@@ -2424,7 +2468,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   document.addEventListener('pointercancel', (event) => {
     const gesture = trackSwipeGesture;
     if (!gesture || gesture.pointerId !== event.pointerId) return;
-    trackSwipeGesture = null;
+    trackSwipeGesture = null; stopSwipeFrame(gesture);
     resetTrackSwipeRow(gesture.row);
   });
 
@@ -2438,6 +2482,28 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     suppressTrackClickId = '';
     return true;
   }
+
+  // Меню «⋮»: не выходит за экран и не заходит под мини-плеер. Позиция считается один раз при открытии.
+  function placeTrackMenu(menu) {
+    const popover = menu.querySelector('.track-context-popover, .playlist-track-menu-popover');
+    if (!popover) return;
+    menu.classList.remove('menu-up');
+    popover.style.removeProperty('--menu-shift');
+    const dock = document.querySelector('#player');
+    const bottomLimit = Math.min(window.innerHeight, dock ? dock.getBoundingClientRect().top : window.innerHeight) - 8;
+    let rect = popover.getBoundingClientRect();
+    const summary = menu.querySelector('summary').getBoundingClientRect();
+    if (rect.bottom > bottomLimit && summary.top - rect.height - 5 > 8) menu.classList.add('menu-up');
+    rect = popover.getBoundingClientRect();
+    let shift = 0;
+    if (rect.left < 8) shift = 8 - rect.left;
+    else if (rect.right > window.innerWidth - 8) shift = window.innerWidth - 8 - rect.right;
+    if (shift) popover.style.setProperty('--menu-shift', shift + 'px');
+  }
+  document.addEventListener('toggle', (event) => {
+    const menu = event.target;
+    if (menu && menu.matches && menu.matches('.track-context-menu[open], .playlist-track-menu[open]')) placeTrackMenu(menu);
+  }, true);
 
   // Keep only one kebab menu open and close it when the user taps elsewhere.
   document.addEventListener('click', (event) => {
@@ -3057,6 +3123,84 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     showToast('Прежние названия возвращены.');
   }
 
+  // ===== Плейлисты как папки «Crimson Playlists/<название>» с музыкой =====
+  let folderSyncTimer = null;
+  let folderSyncRunning = false;
+  let folderSyncAgain = false;
+  let folderSyncWarned = false;
+  function readFolderSynced() { try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.playlistFolders) || '{}') || {}; } catch (_) { return {}; } }
+  function writeFolderSynced(map) { try { localStorage.setItem(STORAGE_KEYS.playlistFolders, JSON.stringify(map)); } catch (_) {} }
+
+  function scheduleFolderSync() {
+    clearTimeout(folderSyncTimer);
+    folderSyncTimer = setTimeout(() => { void syncPlaylistFolders(); }, 2500);
+  }
+
+  async function syncPlaylistFolders({ force = false } = {}) {
+    const plugin = window.CrimsonYtDlp;
+    if (!plugin || typeof plugin.syncPlaylistFolder !== 'function' || !state.libraryLoaded) return;
+    if (folderSyncRunning) { folderSyncAgain = true; return; }
+    folderSyncRunning = true;
+    try {
+      let synced = force ? {} : readFolderSynced();
+      const plan = planFolderSync(synced, state.playlists, trackById);
+      for (const item of plan.remove) {
+        await plugin.deletePlaylistFolder({ folderName: item.folderName });
+        delete synced[item.id]; writeFolderSynced(synced);
+      }
+      for (const item of plan.upsert) {
+        await plugin.syncPlaylistFolder({
+          folderName: item.state.folderName, previousName: item.previousName,
+          manifest: JSON.stringify(item.state.manifest), files: item.state.files
+        });
+        synced[item.id] = { folderName: item.state.folderName, sig: item.sig };
+        writeFolderSynced(synced);
+      }
+      if (force) showToast('Плейлисты записаны в папку «Crimson Playlists».');
+    } catch (error) {
+      // Чаще всего папка не выбрана: сообщаем один раз за сеанс, а не при каждом изменении.
+      if (!folderSyncWarned || force) { folderSyncWarned = true; showToast(String(error && error.message || error)); }
+    } finally {
+      folderSyncRunning = false;
+      if (folderSyncAgain) { folderSyncAgain = false; scheduleFolderSync(); }
+    }
+  }
+
+  /** Находит в выбранной папке плейлисты, которых нет в приложении (например, после переустановки), и восстанавливает их. */
+  async function restorePlaylistsFromFolders({ silent = false } = {}) {
+    const plugin = await waitForNativePlugin();
+    if (!plugin || typeof plugin.readPlaylistFolders !== 'function') return 0;
+    let folders = [];
+    try { folders = ((await plugin.readPlaylistFolders()) || {}).folders || []; } catch (_) { return 0; }
+    if (!folders.length) return 0;
+    let found = playlistsFromFolders(folders, state.tracks, state.playlists);
+    if (!found.playlists.length) { const synced = readFolderSynced(); Object.assign(synced, found.synced); writeFolderSynced(synced); return 0; }
+    // Треки, которых нет в библиотеке (оригиналов нет в сканируемой папке), добавляем из самой папки плейлиста.
+    const need = Array.from(new Set(found.unresolved.map((item) => item.file.sourceId)));
+    const fileTracks = new Map();
+    if (need.length && typeof plugin.ingestPlaylistFiles === 'function') {
+      try {
+        const rows = ((await plugin.ingestPlaylistFiles({ sourceIds: need })) || {}).rows || [];
+        const records = rows.map((row) => folderRecordFromRow(row, null));
+        if (records.length) {
+          await putRecords(records);
+          state.tracks = state.tracks.concat(records.map(attachUrl));
+          notifyLibraryChanged({ skipReconcile: true });
+        }
+        const byName = new Map(found.unresolved.map((item) => [item.file.sourceId, item.file.name]));
+        records.forEach((record) => { const name = byName.get(record.sourceId); if (name) fileTracks.set(String(name).toLocaleLowerCase(), record.id); });
+      } catch (error) { console.warn('Playlist files ingest failed', error); }
+    }
+    found = playlistsFromFolders(folders, state.tracks, state.playlists, fileTracks);
+    state.playlists = state.playlists.concat(found.playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) })));
+    const synced = readFolderSynced();
+    for (const playlist of found.playlists) synced[playlist.id] = found.synced[playlist.id] || { folderName: playlist.name, sig: '' };
+    writeFolderSynced(synced);
+    savePlaylists(); render();
+    if (!silent || found.playlists.length) showToast('Восстановлено плейлистов из папки: ' + found.playlists.length + '.');
+    return found.playlists.length;
+  }
+
   // ===== Автоматическое сканирование папки: фоновый поток в Java, пачки событий, отмена =====
   function attachScanListener() {
     const plugin = window.CrimsonYtDlp;
@@ -3074,7 +3218,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
       const active = isScanActive(scan);
       panel.dataset.phase = scan.phase;
       const bar = panel.querySelector('.scan-bar > span');
-      if (bar) bar.style.width = (active && !scan.total ? 8 : scan.percent) + '%';
+      if (bar) bar.style.transform = 'scaleX(' + ((active && !scan.total ? 8 : scan.percent) / 100) + ')';
       panel.querySelector('.scan-bar').classList.toggle('indeterminate', active && !scan.total);
       panel.querySelector('.scan-message').textContent = scan.phase === 'done' ? 'Готово: ' + scanSummary(scan) : scan.message;
       panel.querySelector('.scan-counters').textContent = scan.total
@@ -3144,6 +3288,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
         notifyLibraryChanged();
         scheduleBackup();
         if (!state.scanSilent) showToast('Папка просканирована: ' + scanSummary(state.scan) + '.');
+        void restorePlaylistsFromFolders({ silent: true });
         await refreshFolderSettings();
         setTimeout(() => { if (!isScanActive(state.scan)) { state.scan = createScanState(); renderScanProgress(); } }, 6000);
       } else if (event.type === 'cancelled') {
@@ -3297,15 +3442,15 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
         (found.level === MATCH_LEVEL.NONE ? '' : '<button type="button" class="match-play" data-youtube-action="play-local" data-id="' + id + '" data-track-id="' + esc(local.id) + '">Воспроизвести</button>') + '</div>' + localLine;
       const downloading = progress && progress.status === 'downloading';
       const completed = progress && progress.status === 'done';
-      const progressText = downloading ? ('Скачивание' + (progress.format ? ' ' + progress.format : '') + ' ' + Math.round(progress.progress || 0) + '%') : '';
-      const downloadLabel = downloading ? progressText : (completed ? ('Скачано · ' + (progress.format || 'готово')) : (progress && progress.status === 'error' ? 'Повторить' : 'Скачать'));
+      const downloadLabel = downloading ? 'Скачивание…' : (completed ? ('Скачано · ' + (progress.format || 'готово')) : (progress && progress.status === 'error' ? 'Повторить' : (progress && progress.status === 'cancelled' ? 'Скачать снова' : 'Скачать')));
       const downloadDisabled = downloading || completed;
       const thumb = video.thumbnail ? '<img class="youtube-thumb" loading="lazy" src="' + esc(video.thumbnail) + '" alt="">' : '<div class="youtube-thumb-fallback">♫</div>';
       return '<article class="youtube-result">' + thumb + '<div class="youtube-result-copy"><div class="youtube-title">' + esc(video.title || 'Без названия') + '</div>' +
         '<div class="youtube-meta">' + esc(video.channel || video.uploader || 'YouTube') + ' · ' + formatVideoDuration(video.duration) + '</div>' + badgeMarkup + '<div class="youtube-actions">' +
         '<button class="primary-action" data-youtube-action="play" data-id="' + id + '"' + (downloading ? ' disabled' : '') + '><svg viewBox="0 0 24 24"><path d="m8 5 12 7-12 7z"/></svg>Слушать</button>' +
         '<button data-youtube-action="download" data-id="' + id + '"' + (downloadDisabled ? ' disabled' : '') + '><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v3h16v-3"/></svg>' + downloadLabel + '</button>' +
-        '</div></div></article>';
+        (downloading ? '<button type="button" class="cancel-download" data-youtube-action="cancel-download" data-id="' + id + '">Отмена</button>' : '') +
+        '</div>' + (downloading ? '<div class="dl-progress" data-dl="' + id + '">' + downloadProgressMarkup(progress) + '</div>' : '') + '</div></article>';
     }).join('');
   }
   const ytErrorMessage = friendlyYoutubeError;
@@ -3381,18 +3526,67 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
       ytStatus('Слушаешь: ' + state.currentRemoteTrack.name);
     } catch (error) { ytStatus('Не удалось запустить поток: ' + ytErrorMessage(error), true); }
   }
-  async function downloadYoutubeVideo(video) {
+  // ===== Скачивание: очередь, прогресс без полной перерисовки списка =====
+  function downloadProgressMarkup(progress) {
+    const view = progressView(progress);
+    return '<div class="dl-lines">' + view.lines.map((line, index) => '<span' + (index === 0 ? ' class="dl-phase"' : '') + '>' + esc(line) + '</span>').join('') + '</div>' +
+      '<div class="dl-bar' + (view.indeterminate ? ' indeterminate' : '') + '"><span style="transform:scaleX(' + ((view.indeterminate ? 35 : view.percent) / 100) + ')"></span></div>';
+  }
+  function updateDownloadDom(id) {
+    const node = document.querySelector('.dl-progress[data-dl="' + (window.CSS && CSS.escape ? CSS.escape(String(id)) : String(id)) + '"]');
+    const progress = state.ytDownloads[id];
+    if (!node || !progress) return;
+    const view = progressView(progress);
+    const lines = node.querySelectorAll('.dl-lines > span');
+    if (lines.length !== view.lines.length) { node.innerHTML = downloadProgressMarkup(progress); return; }
+    view.lines.forEach((line, index) => { if (lines[index].textContent !== line) lines[index].textContent = line; });
+    const bar = node.querySelector('.dl-bar');
+    bar.classList.toggle('indeterminate', view.indeterminate);
+    bar.firstElementChild.style.transform = 'scaleX(' + ((view.indeterminate ? 35 : view.percent) / 100) + ')';
+  }
+  // Не чаще 4 раз в секунду на каждое скачивание; список результатов при этом не пересобирается.
+  const progressThrottles = new Map();
+  function scheduleProgressUpdate(id) {
+    if (!progressThrottles.has(id)) progressThrottles.set(id, createThrottle(() => updateDownloadDom(id), 250));
+    progressThrottles.get(id)();
+  }
+
+  function readDownloadConcurrency() {
+    try { return clampConcurrency(localStorage.getItem(STORAGE_KEYS.downloadConcurrency) ?? DEFAULT_CONCURRENCY); } catch (_) { return DEFAULT_CONCURRENCY; }
+  }
+  const downloadQueue = createDownloadQueue({
+    concurrency: readDownloadConcurrency(),
+    run: (job) => runYoutubeDownload(job.video),
+    cancelNative: async (id) => { const plugin = window.CrimsonYtDlp; if (plugin && typeof plugin.cancelDownload === 'function') await plugin.cancelDownload({ id }); }
+  });
+
+  function enqueueYoutubeDownload(video) {
     if (!nativeYtDlp()) { showToast('Скачивание доступно в установленном Android APK.'); return; }
-    state.ytDownloads[video.id] = {status:'downloading',progress:0}; renderOnlineResults();
+    if (downloadQueue.isActive(video.id)) return;   // то же задание не запускается дважды
+    state.ytDownloads[video.id] = mergeProgress(null, { phase: 'queued', progress: 0 });
+    renderOnlineResults();
+    void downloadQueue.add({ id: String(video.id), video }).then((outcome) => {
+      if (outcome.state === 'cancelled') { state.ytDownloads[video.id] = { status: 'cancelled', progress: 0 }; ytStatus('Загрузка отменена.'); }
+      else if (outcome.state === 'error') { state.ytDownloads[video.id] = { status: 'error', progress: 0 }; ytStatus('Не удалось скачать аудио: ' + ytErrorMessage(outcome.error), true); }
+      progressThrottles.delete(String(video.id));
+      renderOnlineResults();
+    });
+  }
+
+  async function runYoutubeDownload(video) {
+    state.ytDownloads[video.id] = mergeProgress(state.ytDownloads[video.id], { phase: 'extracting', progress: 0 });
+    renderOnlineResults();
     ytStatus('Скачиваю аудио в Crimson: ' + (video.title || 'YouTube') + '…');
-    try {
+    {
       // Единый механизм: исполнитель/название определяются один раз и дальше используются
       // для тегов, имени файла, записи в библиотеке и отображения.
       let rawInfo = {};
+      let infoFile = '';
       try {
         if (typeof window.CrimsonYtDlp.fetchTrackMetadata === 'function') {
           const fetched = await window.CrimsonYtDlp.fetchTrackMetadata({ url: video.url });
           rawInfo = (fetched && fetched.info) || {};
+          infoFile = (fetched && fetched.infoFile) || '';   // скачивание использует этот ответ и не извлекает информацию заново
         }
       } catch (_) { /* метаданные необязательны: используем данные поиска */ }
       const meta = buildTrackMetadata({
@@ -3408,8 +3602,11 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
         year: meta.year,
         genre: meta.genre,
         resolved: true,
+        infoFile,
         format: 'original'
       });
+      state.ytDownloads[video.id] = mergeProgress(state.ytDownloads[video.id], { phase: 'saving', progress: 100 });
+      updateDownloadDom(video.id);
       const sourceId = String(video.id);
       const existing = state.tracks.find((track) =>
         String(track.sourceId || '') === sourceId ||
@@ -3442,10 +3639,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
       render();
       ytStatus('Скачано в медиатеку Crimson: ' + record.name + ' · формат: ' + (saved.format || 'не указан'));
       showToast('Трек скачан (' + (saved.format || 'формат не указан') + ') и добавлен в медиатеку');
-    } catch (error) {
-      state.ytDownloads[video.id] = {status:'error',progress:0};
-      ytStatus('Не удалось скачать аудио: ' + ytErrorMessage(error), true);
-    } finally { renderOnlineResults(); }
+    }
   }
   $('#youtubeSearchForm').addEventListener('submit', (event) => { event.preventDefault(); state.view = 'youtube'; void searchYoutube($('#youtubeQuery').value); });
   $('#youtubeResults').addEventListener('click', (event) => {
@@ -3453,7 +3647,8 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     const video = state.ytResults.find((item) => String(item.id) === String(button.dataset.id)); if (!video) return;
     if (button.dataset.youtubeAction === 'play-local') { const id = button.dataset.trackId; if (trackById(id)) void playTrack(id, libraryOrderIds()); return; }
     if (button.dataset.youtubeAction === 'play') void playYoutubeVideo(video);
-    if (button.dataset.youtubeAction === 'download') void downloadYoutubeVideo(video);
+    if (button.dataset.youtubeAction === 'download') enqueueYoutubeDownload(video);
+    if (button.dataset.youtubeAction === 'cancel-download') void downloadQueue.cancel(String(video.id));
   });
   $('#importCookies').addEventListener('click', () => $('#cookiesPicker').click());
   $('#cookiesPicker').addEventListener('change', async (event) => {
@@ -3480,10 +3675,18 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     state.downloadListenerAttached = true;
     plugin.addListener('downloadProgress', (event) => {
       if (!event || !event.id) return;
-      state.ytDownloads[event.id] = {status:'downloading',progress:Number(event.progress)||0,eta:Number(event.eta)||0,format:String(event.format||''),message:String(event.message||'')};
+      const previous = state.ytDownloads[event.id];
+      if (previous && !ACTIVE_PHASES.has(previous.phase) && previous.status !== 'downloading') return; // запоздавшее событие после завершения
+      const next = mergeProgress(previous, event);
+      const phaseChanged = !previous || previous.phase !== next.phase;
+      state.ytDownloads[event.id] = next;
       if (event.message) ytStatus(String(event.message));
-      if (state.view === 'youtube') renderOnlineResults();
+      if (state.view !== 'youtube') return;
+      // Обычные события обновляют только полоску этого трека; полная перерисовка — только при смене состояния.
+      if (phaseChanged && !document.querySelector('.dl-progress[data-dl]')) renderOnlineResults();
+      else scheduleProgressUpdate(String(event.id));
     });
+    plugin.addListener('downloadPublished', (event) => { if (event && event.ok === false && event.message) showToast(String(event.message)); });
   }
 
   window.addEventListener('crimson-yt-dlp-ready', () => {

@@ -78,16 +78,30 @@
           </div>
         </article>
         <article class="settings-card">
-          <div class="settings-card-title"><span class="settings-symbol">⛨</span><div><h3>Данные и резервные копии</h3><p>Плейлисты, порядок треков и настройки хранятся вне библиотеки и копируются автоматически. После переустановки они восстанавливаются сами, а треки сопоставляются по названию и исполнителю после сканирования папки.</p></div></div>
+          <div class="settings-card-title"><span class="settings-symbol">⛨</span><div><h3>Плейлисты и резервные копии</h3><p>Каждый плейлист хранится как папка «Crimson Playlists/название» внутри выбранной папки: в ней лежат треки и порядок воспроизведения. После переустановки выбери ту же папку — плейлисты вернутся вместе с музыкой. Треки копируются в папку плейлиста, поэтому занимают место дважды.</p></div></div>
           <div id="dataStatus" class="settings-status">Резервная копия создаётся автоматически после изменений.</div>
           <div class="settings-actions">
-            <button id="backupNow" type="button" class="primary-button">Создать копию сейчас</button>
+            <button id="syncPlaylistFolders" type="button" class="primary-button">Записать плейлисты в папки</button>
+            <button id="restorePlaylistFolders" type="button" class="secondary-button">Найти плейлисты в папке</button>
+            <button id="backupNow" type="button" class="secondary-button">Создать копию сейчас</button>
             <button id="restoreBackup" type="button" class="secondary-button">Восстановить из копии</button>
             <button id="restoreBackupFile" type="button" class="secondary-button">Восстановить из файла…</button>
             <button id="exportPlaylists" type="button" class="secondary-button">Экспорт плейлистов</button>
             <button id="importPlaylists" type="button" class="secondary-button">Импорт плейлистов</button>
             <button id="checkIntegrity" type="button" class="secondary-button">Проверить целостность</button>
             <button id="wipeData" type="button" class="danger-button">Удалить все данные…</button>
+          </div>
+        </article>
+        <article class="settings-card">
+          <div class="settings-card-title"><span class="settings-symbol">◐</span><div><h3>Упрощённые анимации</h3><p>Отключает переходы и анимации. Включи, если интерфейс притормаживает на этом устройстве.</p></div></div>
+          <label class="settings-switch"><input id="liteMotion" type="checkbox"> Упрощённые анимации</label>
+        </article>
+        <article class="settings-card">
+          <div class="settings-card-title"><span class="settings-symbol">⇅</span><div><h3>Одновременные загрузки</h3><p>Сколько треков скачивается одновременно. Остальные ждут в очереди; ошибка одного трека очередь не останавливает. Больше значений — выше нагрузка на сеть и процессор.</p></div></div>
+          <div class="settings-actions">
+            <select id="downloadConcurrency" class="settings-select" aria-label="Одновременные загрузки">
+              <option value="1">1 трек</option><option value="2">2 трека (рекомендуется)</option><option value="3">3 трека</option><option value="4">4 трека</option>
+            </select>
           </div>
         </article>
         <article class="settings-card">
