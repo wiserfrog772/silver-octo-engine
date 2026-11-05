@@ -701,7 +701,8 @@ public class YtDlpPlugin extends Plugin {
             JSArray rows = new JSArray();
             try {
                 for (int i = 0; sources != null && i < sources.length(); i++) {
-                    String sourceUri = sources.getString(i);
+                    String sourceUri = sources.optString(i, "");   // optString не бросает JSONException
+                    if (sourceUri.isEmpty()) continue;
                     try {
                         DocumentFile document = DocumentFile.fromSingleUri(getContext(), Uri.parse(sourceUri));
                         if (document == null || !document.isFile()) continue;
