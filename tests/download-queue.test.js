@@ -43,6 +43,28 @@ test('повторное добавление активного задания 
   await queue.add({ id: 'x' }); assert.equal(calls, 2);
 });
 
+test('отменяемая нативная загрузка продолжает занимать слот и блокирует повторный ID', async () => {
+  const gates = new Map();
+  const queue = q.createDownloadQueue({ concurrency: 1,
+    run: async (job) => { const gate = deferred(); gates.set(job.id, gate); return gate.promise; },
+    cancelNative: async () => true });
+  const first = queue.add({ id: 'same' });
+  await tick();
+  await queue.cancel('same');
+  const duplicate = queue.add({ id: 'same' });
+  const next = queue.add({ id: 'next' });
+  assert.equal(duplicate, first, 'пока нативная отмена не завершилась, ID остаётся занятым');
+  await tick();
+  assert.deepEqual(queue.counts(), { running: 1, queued: 1 });
+  assert.equal(gates.has('next'), false, 'следующая задача не обходит лимит параллелизма');
+  gates.get('same').reject(new Error('cancelled'));
+  assert.equal((await first).state, 'cancelled');
+  await tick();
+  assert.equal(gates.has('next'), true);
+  gates.get('next').resolve('ok');
+  assert.equal((await next).state, 'done');
+});
+
 test('отмена ожидающего и выполняющегося задания', async () => {
   const cancelled = []; const d = deferred();
   const queue = q.createDownloadQueue({ concurrency: 1,

@@ -233,6 +233,35 @@ test('резервные копии: правила Auto Backup, hasFragileUserD
   assert.doesNotMatch(rules, /domain="database"|domain="root"/);
 });
 
+test('резервная копия зеркалируется и читается из обеих пользовательских папок', () => {
+  const java = read('native/android/app/src/main/java/com/localify/crimson/YtDlpPlugin.java');
+  const save = java.slice(java.indexOf('public void saveBackup('), java.indexOf('public void readBackups('));
+  const load = java.slice(java.indexOf('public void readBackups('), java.indexOf('public void wipeBackups('));
+  assert.match(save, /BackupStore\.mirror\(getContext\(\), libraryTree, json\)/);
+  assert.match(save, /BackupStore\.mirror\(getContext\(\), downloadTree, json\)/);
+  assert.match(load, /storagePrefs\(\)\.getString\(LIBRARY_TREE_URI/);
+  assert.match(load, /storagePrefs\(\)\.getString\(DOWNLOAD_TREE_URI/);
+  assert.match(load, /BackupStore\.readAllCandidates\(getContext\(\), libraryTree, downloadTree\)/);
+  const app = read('www/app.js');
+  assert.match(app, /downloadConcurrency: readDownloadConcurrency\(\)/);
+  assert.match(app, /liteMotion/);
+  assert.match(app, /restoreBackupQueue\(\)/);
+  assert.match(app, /async function restoreNativeBackupIfEmpty\(\)/);
+  assert.match(app, /function saveQueue\(\) \{[\s\S]*?scheduleBackup\(\);/);
+});
+
+test('папки плейлистов используют манифест-ссылки и не создают аудиокопии', () => {
+  const java = read('native/android/app/src/main/java/com/localify/crimson/YtDlpPlugin.java');
+  const folders = read('www/modules/playlist-folders.mjs');
+  const docs = read('docs/DATA-PERSISTENCE.md');
+  assert.match(java, /sameDocumentContent\(DocumentFile document, File source\)/);
+  assert.match(java, /manifest\.put\("managed", new JSONArray\(\)\)/);
+  assert.doesNotMatch(java, /copyLocalFileToDocument/);
+  assert.match(folders, /reference-only-v2/);
+  assert.match(folders, /additions/);
+  assert.match(docs, /без физических копий аудио/);
+});
+
 test('нижний плеер: блок кнопок привязан к строке трека, а не к центру всей панели', () => {
   const css = read('www/crimson-theme.css');
   assert.match(css, /#player:not\(\.player-fullscreen\) \.player-controls \{ top: 10px; bottom: auto; height: 56px; transform: none; \}/);

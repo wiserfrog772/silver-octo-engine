@@ -18,8 +18,10 @@ test('имена папок и файлов безопасны и уникаль
   assert.equal(f.safeName('Плейлист. '), 'Плейлист');
   const state = f.buildFolderState({ id: 'p', name: 'Мой', trackIds: ['t1', 't2', 't3', 't4'] }, byId);
   assert.deepEqual(state.files.map((x) => x.fileName), ['Linkin Park - Numb.mp3', 'Adele - Hello.m4a', 'Adele - Hello (2).m4a']);
-  assert.equal(state.skipped, 1, 'трек без локального файла пропущен и посчитан');
-  assert.deepEqual(state.manifest.entries.map((e) => e.file), state.files.map((x) => x.fileName));
+  assert.equal(state.skipped, 1, 'трек без локального файла не копируется и учитывается');
+  assert.equal(state.manifest.entries.length, 4, 'ссылка на импортированный трек всё равно сохраняется');
+  assert.equal(state.manifest.entries[3].ref.name, 'Из памяти браузера');
+  assert.deepEqual(state.manifest.entries.slice(0, 3).map((e) => e.file), state.files.map((x) => x.fileName));
 });
 
 test('синхронизация: создание, обновление при изменении порядка/названия, удаление', () => {
@@ -28,7 +30,13 @@ test('синхронизация: создание, обновление при 
   assert.equal(plan.upsert.length, 1);
   assert.equal(plan.upsert[0].previousName, '');
   const synced = { p1: { folderName: plan.upsert[0].state.folderName, sig: plan.upsert[0].sig } };
-  assert.equal(f.planFolderSync(synced, [pl()], byId).upsert.length, 0, 'без изменений ничего не копируется');
+  assert.equal(f.planFolderSync(synced, [pl()], byId).upsert.length, 0, 'без изменений манифест не переписывается');
+  const noPathTrack = { id: 'memory', name: 'Browser import', artist: 'X', nativePath: '' };
+  const noPathLookup = (id) => id === 'memory' ? noPathTrack : byId(id);
+  const firstMemory = f.planFolderSync({}, [{ id: 'memory-playlist', name: 'Memory', trackIds: [] }], noPathLookup);
+  const storedMemory = { 'memory-playlist': { folderName: 'Memory', sig: firstMemory.upsert[0].sig } };
+  const withMemoryTrack = f.planFolderSync(storedMemory, [{ id: 'memory-playlist', name: 'Memory', trackIds: ['memory'] }], noPathLookup);
+  assert.equal(withMemoryTrack.upsert.length, 1, 'новая ссылка без nativePath тоже меняет манифест');
   plan = f.planFolderSync(synced, [pl({ trackIds: ['t2', 't1'] })], byId);
   assert.equal(plan.upsert.length, 1, 'порядок изменился');
   plan = f.planFolderSync(synced, [pl({ name: 'Новое имя' })], byId);
@@ -64,11 +72,31 @@ test('восстановление после переустановки: пле
   assert.equal(f.playlistsFromFolders([{ dirName: 'x', manifest: '{oops', files: [] }, { dirName: 'y', manifest: '{"app":"other"}', files: [] }], fresh, []).playlists.length, 0);
 });
 
-test('файл, удалённый из папки, не попадает в восстановленный плейлист', () => {
+test('манифест восстанавливает плейлист без аудиокопий в его папке', () => {
   const state = f.buildFolderState({ id: 'p1', name: 'P', trackIds: ['t1', 't2'] }, byId);
-  const folders = [{ dirName: 'P', manifest: JSON.stringify(state.manifest), files: [{ name: state.files[0].fileName, sourceId: 's' }] }];
+  const folders = [{ dirName: 'P', manifest: JSON.stringify(state.manifest), files: [] }];
   const fresh = [{ id: 'N1', name: 'Numb', artist: 'Linkin Park' }, { id: 'N2', name: 'Hello', artist: 'Adele' }];
-  assert.deepEqual(f.playlistsFromFolders(folders, fresh, []).playlists[0].trackIds, ['N1']);
+  const restored = f.playlistsFromFolders(folders, fresh, []);
+  assert.deepEqual(restored.playlists[0].trackIds, ['N1', 'N2']);
+  assert.equal(restored.unresolved.length, 0);
+});
+
+test('ручной аудиофайл в существующей папке импортируется и добавляется только в этот плейлист', () => {
+  const state = f.buildFolderState({ id: 'p1', name: 'P', trackIds: ['t1'] }, byId);
+  const folders = [{ dirName: 'P', manifest: JSON.stringify(state.manifest), files: [
+    { name: 'Linkin Park - Numb.mp3', sourceId: 'content://old-copy' },
+    { name: 'Adele - Hello.mp3', sourceId: 'content://new-track' }
+  ] }];
+  const current = [{ id: 'p1', name: 'P', trackIds: ['N1'] }];
+  const first = f.playlistsFromFolders(folders, [{ id: 'N1', name: 'Numb', artist: 'Linkin Park' }], current);
+  assert.equal(first.playlists.length, 0, 'существующий плейлист не заменяется');
+  assert.deepEqual(first.unresolved.map((item) => item.file.sourceId), ['content://new-track']);
+
+  const afterImport = f.playlistsFromFolders(folders, [
+    { id: 'N1', name: 'Numb', artist: 'Linkin Park' },
+    { id: 'N2', sourceId: 'content://new-track', name: 'Hello', artist: 'Adele' }
+  ], current, new Map([['content://new-track', 'N2']]));
+  assert.deepEqual(afterImport.additions, [{ playlistId: 'p1', trackIds: ['N2'] }]);
 });
 
 test('имя файла из папки разбирается теми же правилами, что и библиотека', () => {

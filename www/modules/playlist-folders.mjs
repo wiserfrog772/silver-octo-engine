@@ -1,9 +1,9 @@
 /**
- * Плейлисты как папки: «Crimson Playlists/<Название>/» с музыкой и манифестом crimson-playlist.json.
- * Папка лежит в выбранной пользователем папке, поэтому переживает переустановку: после выбора той же папки
- * плейлисты восстанавливаются вместе с порядком треков.
+ * Плейлисты как папки: «Crimson Playlists/<Название>/» с манифестом-ссылками crimson-playlist.json.
+ * Аудио не копируется в каждую подборку. Папка лежит в выбранном пользователем хранилище и переживает
+ * переустановку: после выбора той же папки плейлисты восстанавливаются вместе с порядком треков.
  */
-import { hash53, refFromTrack, reconcilePlaylists, normalizePlaylist } from './backup.mjs';
+import { hash53, refFromTrack, reconcilePlaylists, normalizePlaylist, buildTrackLookup, resolveTrackRef } from './backup.mjs';
 import { libraryNameFromFilename, stripAudioExtension } from './track-identity.mjs';
 
 export const PLAYLISTS_DIR = 'Crimson Playlists';
@@ -32,7 +32,7 @@ export function extensionOf(path) {
   return match ? '.' + match[1].toLowerCase() : '';
 }
 
-/** Имя файла внутри папки плейлиста: «Исполнитель - Название.ext», уникальное в пределах папки. */
+/** Стабильное имя ссылки на трек в манифесте плейлиста; аудиофайл с этим именем не создаётся. */
 export function trackFileName(track, used) {
   const ext = extensionOf(track.fileName) || extensionOf(track.nativePath) || '.mp3';
   const original = track.fileName && AUDIO_EXT_RE.test(track.fileName) ? stripAudioExtension(track.fileName) : '';
@@ -40,7 +40,7 @@ export function trackFileName(track, used) {
   return uniqueName(base, used, ext);
 }
 
-/** Состояние папки плейлиста: какие файлы должны лежать в ней и что записать в манифест. */
+/** Состояние папки плейлиста: логические ссылки на исходные файлы и манифест для восстановления. */
 export function buildFolderState(playlist, getTrack) {
   const used = new Set([MANIFEST_NAME.toLocaleLowerCase()]);
   const files = [];
@@ -49,13 +49,14 @@ export function buildFolderState(playlist, getTrack) {
   for (const id of playlist.trackIds || []) {
     const track = getTrack(id);
     if (!track) continue;
-    if (!track.nativePath) { skipped += 1; continue; }   // трек без локального файла (например, импорт из памяти браузера) копировать нечем
     const fileName = trackFileName(track, used);
-    files.push({ path: track.nativePath, fileName });
+    // Ref remains recoverable even for in-memory imports without a persistent native file path.
     entries.push({ file: fileName, ref: refFromTrack(track) });
+    if (!track.nativePath) { skipped += 1; continue; }
+    files.push({ path: track.nativePath, fileName });
   }
   const manifest = {
-    app: 'crimson', kind: MANIFEST_KIND, schema: 1,
+    app: 'crimson', kind: MANIFEST_KIND, schema: 2,
     id: playlist.id, name: playlist.name, createdAt: playlist.createdAt || 0,
     entries
   };
@@ -63,7 +64,13 @@ export function buildFolderState(playlist, getTrack) {
 }
 
 export function folderSignature(state) {
-  return hash53(JSON.stringify([state.folderName, state.files.map((f) => [f.fileName, f.path])]));
+  // v2 switches playlist folders from per-playlist audio copies to reference-only manifests.
+  // The version marker forces one migration sync for existing installations.
+  return hash53(JSON.stringify([
+    'reference-only-v2', state.folderName,
+    state.files.map((f) => [f.fileName, f.path]),
+    state.manifest.entries
+  ]));
 }
 
 /**
@@ -98,41 +105,95 @@ export function parseManifest(text) {
 
 /**
  * Плейлисты из найденных папок. Уже существующие (по id) не затрагиваются.
- * Файлы, которых нет в библиотеке, возвращаются в unresolved — приложение добавит их в библиотеку из самой папки.
+ * Ссылки манифеста восстанавливаются и без аудиокопий. Новые файлы, вручную положенные в папку,
+ * возвращаются в unresolved для импорта; additions содержит новые связи для уже существующих плейлистов.
  * @param folders [{ dirName, manifest: string, files: [{ name, sourceId, size, lastModified }] }]
- * @param fileTracks Map(имя файла в нижнем регистре → id трека библиотеки)
+ * @param fileTracks Map(sourceId или имени файла в нижнем регистре → id трека библиотеки)
  */
 export function playlistsFromFolders(folders, tracks, existing = [], fileTracks = new Map()) {
-  const known = new Set(existing.map((p) => p.id));
+  const existingById = new Map(existing.map((playlist) => [String(playlist.id), playlist]));
   const created = [];
   const unresolved = [];
+  const additions = [];
   const synced = {};
+  const lookup = buildTrackLookup(tracks);
+
   for (const folder of folders || []) {
     const parsed = parseManifest(folder.manifest);
     if (!parsed.ok) continue;
     const { manifest } = parsed;
-    const present = new Map((folder.files || []).map((f) => [String(f.name).toLocaleLowerCase(), f]));
+    const present = new Map((folder.files || [])
+      .filter((file) => file && file.name && extensionOf(file.name))
+      .map((file) => [String(file.name).toLocaleLowerCase(), file]));
+    const manifestEntries = manifest.entries.filter((entry) => entry && (entry.file || entry.ref));
+    const represented = new Set(manifestEntries.map((entry) => String(entry.file || '').toLocaleLowerCase()).filter(Boolean));
     synced[manifest.id] = { folderName: folder.dirName, sig: '' };
-    if (known.has(manifest.id)) continue;
-    const entries = manifest.entries.filter((e) => e && e.file && present.has(String(e.file).toLocaleLowerCase()));
+
+    const refs = [];
+    const candidates = [];
+    for (const entry of manifestEntries) {
+      const fileKey = String(entry.file || '').toLocaleLowerCase();
+      const linkedFile = fileKey ? present.get(fileKey) : null;
+      const originalRef = entry.ref && typeof entry.ref === 'object' ? entry.ref : {};
+      const fileTrackId = (linkedFile && fileTracks.get(String(linkedFile.sourceId || ''))) || (fileKey ? fileTracks.get(fileKey) : '');
+      const ref = {
+        id: fileTrackId || originalRef.id || '',
+        name: originalRef.name || '', artist: originalRef.artist || '',
+        duration: Math.max(0, Math.round(Number(originalRef.duration) || 0)),
+        ...(originalRef.sourceId ? { sourceId: originalRef.sourceId } : {}),
+        ...(originalRef.youtubeId ? { youtubeId: originalRef.youtubeId } : {})
+      };
+      if (ref.id || ref.name || ref.sourceId || ref.youtubeId) refs.push(ref);
+      // Existing manifests may still have audio copies. Only ingest one if it is present and
+      // cannot be resolved against the canonical library yet.
+      if (linkedFile) candidates.push({ file: linkedFile, ref });
+    }
+
+    // Audio put into a playlist directory manually is a new playlist item, not an orphan.
+    for (const [key, file] of present) {
+      if (represented.has(key)) continue;
+      const identity = identityForFolderFile(file);
+      const ref = {
+        id: fileTracks.get(String(file.sourceId || '')) || fileTracks.get(key) || '', name: identity.name, artist: identity.artist,
+        duration: Math.max(0, Math.round(Number(file.duration) || 0)),
+        ...(file.sourceId ? { sourceId: String(file.sourceId) } : {})
+      };
+      refs.push(ref);
+      candidates.push({ file, ref });
+    }
+
+    const knownPlaylist = existingById.get(String(manifest.id));
+    if (knownPlaylist) {
+      // Existing playlist contents/order remain authoritative. Only append genuinely new
+      // files discovered in the physical folder; do not reset a user's in-app edits.
+      const pendingIds = [];
+      for (const candidate of candidates) {
+        const resolved = resolveTrackRef(candidate.ref, lookup);
+        if (resolved) {
+          if (!(knownPlaylist.trackIds || []).some((id) => String(id) === String(resolved.id))) pendingIds.push(String(resolved.id));
+        } else if (candidate.file && candidate.file.sourceId) {
+          unresolved.push({ playlistId: manifest.id, file: candidate.file, ref: candidate.ref });
+        }
+      }
+      if (pendingIds.length) additions.push({ playlistId: manifest.id, trackIds: [...new Set(pendingIds)] });
+      continue;
+    }
+
     const base = normalizePlaylist({
-      id: manifest.id, name: manifest.name, createdAt: manifest.createdAt,
-      // fileTracks: имя файла → id трека, добавленного в библиотеку прямо из этой папки (приоритетнее сопоставления по названию)
-      trackIds: [], refs: entries.map((e) => ({ ...e.ref, id: fileTracks.get(String(e.file).toLocaleLowerCase()) || '' }))
+      id: manifest.id, name: manifest.name || folder.dirName, createdAt: manifest.createdAt,
+      trackIds: [], refs
     });
     if (!base) continue;
-    // Сопоставляем ссылки с библиотекой; порядок задаёт манифест.
     const { playlists: [resolved] } = reconcilePlaylists([base], tracks);
     created.push(resolved);
-    const resolvedKeys = new Set();
-    resolved.trackIds.forEach((id) => resolvedKeys.add(id));
-    entries.forEach((entry, index) => {
-      const ref = base.refs[index];
-      const stillPending = (resolved.refs || []).some((r) => r.name === ref.name && r.artist === ref.artist && !tracks.some((t) => String(t.id) === String(r.id)));
-      if (stillPending || !resolved.trackIds.length) unresolved.push({ playlistId: manifest.id, file: present.get(String(entry.file).toLocaleLowerCase()), ref: entry.ref });
-    });
+
+    for (const candidate of candidates) {
+      if (!resolveTrackRef(candidate.ref, lookup) && candidate.file && candidate.file.sourceId) {
+        unresolved.push({ playlistId: manifest.id, file: candidate.file, ref: candidate.ref });
+      }
+    }
   }
-  return { playlists: created, unresolved, synced };
+  return { playlists: created, unresolved, synced, additions };
 }
 
 /** Имя и исполнитель для файла, найденного в папке плейлиста (когда его нет в библиотеке). */

@@ -37,6 +37,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     playlists: 'localify.mobile.playlists'
   };
   const SORT_MODES = ['recent', 'title', 'artist'];
+  const LITE_MOTION_KEY = 'crimson.mobile.lite-motion';
   const libraryStore = createLibraryStore({ databaseName: DB_NAME, version: DB_VERSION, storeName: STORE });
   const SWIPE_HINT = '<div class="track-swipe-hint" aria-hidden="true"><span class="swipe-icon"><svg viewBox="0 0 24 24" class="swipe-icon-add"><path d="M4 6h12M4 12h8M4 18h6M18 12v8m-4-4h8"/></svg><svg viewBox="0 0 24 24" class="swipe-icon-done"><path d="M5 13l4 4L19 7"/></svg></span><small>Добавить в плейлист</small></div>';
   const libraryMatcher = createLibraryMatcher();
@@ -101,7 +102,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     intentionalPausePending: false,
     playerCoverKey: '',
     searchRenderTimer: null,
-    sortMode: readSortMode()
+    sortMode: readSortMode(), pendingQueueRefs: null
   };
   const audio = $('#audio');
   const filePicker = $('#filePicker');
@@ -939,11 +940,60 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   const backupPlugin = () => (window.CrimsonYtDlp && typeof window.CrimsonYtDlp.saveBackup === 'function' ? window.CrimsonYtDlp : null);
 
   function buildBackupSnapshot() {
+    let liteMotion = null;
+    try { liteMotion = localStorage.getItem(LITE_MOTION_KEY) === '1'; } catch (_) {}
     return createSnapshot({
       playlists: state.playlists, tracks: state.tracks, queue: state.queue,
       quickAddPlaylistId: state.quickAddPlaylistId, playbackPlaylistId: state.playbackPlaylistId,
-      sortMode: state.sortMode, settings: { sortMode: state.sortMode }
+      sortMode: state.sortMode,
+      settings: {
+        sortMode: state.sortMode,
+        downloadConcurrency: readDownloadConcurrency(),
+        liteMotion
+      }
     });
+  }
+
+  /** Восстанавливает настройки и ссылки очереди из снимка без подмены трековых ID. */
+  function restoreBackupPreferences(data) {
+    const snapshot = data && typeof data === 'object' ? data : {};
+    const settings = snapshot.settings && typeof snapshot.settings === 'object' ? snapshot.settings : {};
+    const sortMode = SORT_MODES.includes(settings.sortMode) ? settings.sortMode : snapshot.sortMode;
+    if (SORT_MODES.includes(sortMode)) {
+      state.sortMode = sortMode;
+      try { localStorage.setItem(STORAGE_KEYS.sort, sortMode); } catch (_) {}
+    }
+    if (Number.isFinite(Number(settings.downloadConcurrency)) && settings.downloadConcurrency !== null && settings.downloadConcurrency !== '') {
+      const value = clampConcurrency(settings.downloadConcurrency);
+      try { localStorage.setItem(STORAGE_KEYS.downloadConcurrency, String(value)); } catch (_) {}
+      downloadQueue.setConcurrency(value);
+      const control = $('#downloadConcurrency');
+      if (control) control.value = String(value);
+    }
+    if (typeof settings.liteMotion === 'boolean') {
+      try { localStorage.setItem(LITE_MOTION_KEY, settings.liteMotion ? '1' : '0'); } catch (_) {}
+      applyLiteMotion(settings.liteMotion);
+      const control = $('#liteMotion');
+      if (control) control.checked = settings.liteMotion;
+    }
+    if (snapshot.quickAddPlaylistId) {
+      state.quickAddPlaylistId = String(snapshot.quickAddPlaylistId);
+      try { localStorage.setItem(STORAGE_KEYS.quickAddPlaylist, state.quickAddPlaylistId); } catch (_) {}
+    }
+    if (snapshot.playbackPlaylistId) {
+      state.playbackPlaylistId = String(snapshot.playbackPlaylistId);
+      try { localStorage.setItem(STORAGE_KEYS.playbackPlaylist, state.playbackPlaylistId); } catch (_) {}
+    }
+    if (Array.isArray(snapshot.queue)) state.pendingQueueRefs = snapshot.queue;
+  }
+
+  function restoreBackupQueue() {
+    if (!Array.isArray(state.pendingQueueRefs)) return;
+    const holder = { id: 'crimson-backup-queue', name: 'Backup queue', trackIds: [], refs: state.pendingQueueRefs };
+    const reconciled = reconcilePlaylists([holder], state.tracks).playlists[0];
+    state.queue = uniqueTrackIds(reconciled ? reconciled.trackIds : []);
+    state.pendingQueueRefs = null;
+    saveQueue();
   }
 
   function scheduleBackup() {
@@ -1000,12 +1050,11 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     if (stored.missing) {
       // Данных нет: первый запуск или переустановка. Ищем резервную копию.
       const { best } = pickNewestValidBackup(await readNativeBackups());
-      if (best && best.snapshot.data.playlists.length) {
-        list = best.snapshot.data.playlists;
+      if (best) {
         const extras = best.snapshot.data;
-        if (extras.quickAddPlaylistId) state.quickAddPlaylistId = extras.quickAddPlaylistId;
-        if (SORT_MODES.includes(extras.sortMode)) { state.sortMode = extras.sortMode; try { localStorage.setItem(STORAGE_KEYS.sort, state.sortMode); } catch (_) {} }
-        note = 'Плейлисты восстановлены из резервной копии: ' + list.length + '. Треки подтянутся после сканирования папки.';
+        list = Array.isArray(extras.playlists) ? extras.playlists : [];
+        restoreBackupPreferences(extras);
+        note = 'Данные Crimson восстановлены из резервной копии. Треки подтянутся после сканирования папки.';
       }
     }
     return { playlists: list.map((item) => normalizePlaylist(item)).filter(Boolean), note };
@@ -1043,6 +1092,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     await saveBackupNow();
     const reconciled = reconcilePlaylists(best.snapshot.data.playlists, state.tracks);
     state.playlists = reconciled.playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) }));
+    restoreBackupPreferences(best.snapshot.data); restoreBackupQueue();
     savePlaylists(); render();
     showToast('Восстановлено плейлистов: ' + state.playlists.length + (reconciled.pending ? '. Не найдено пока треков: ' + reconciled.pending : '.'));
   }
@@ -1058,6 +1108,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
       await saveBackupNow();
       const reconciled = reconcilePlaylists(decoded.snapshot.data.playlists, state.tracks);
       state.playlists = reconciled.playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) }));
+      restoreBackupPreferences(decoded.snapshot.data); restoreBackupQueue();
       savePlaylists(); render();
       showToast('Данные восстановлены из файла.');
     } catch (error) { if (!/отмен/i.test(String(error && error.message || error))) showToast('Не удалось восстановить: ' + (error && error.message || error)); }
@@ -1179,6 +1230,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
         // Ссылки на треки сопоставляются с библиотекой: после переустановки id другие, а плейлисты остаются.
         const reconciled = reconcilePlaylists(loaded.playlists, state.tracks);
         state.playlists = reconciled.playlists.map((item) => ({ ...item, name: item.name.slice(0, 60), trackIds: uniqueTrackIds(item.trackIds) }));
+        restoreBackupQueue();
         if (loaded.note) showToast(loaded.note);
       } catch (error) { console.error('Playlists load failed', error); state.playlists = []; }
       savePlaylists();
@@ -1541,6 +1593,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
 
   function saveQueue() {
     try { localStorage.setItem(STORAGE_KEYS.queue, JSON.stringify(state.queue)); } catch (_) {}
+    scheduleBackup();
   }
 
   function enqueue(id) {
@@ -2213,7 +2266,6 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
 
   $('#chooseLibraryFolder').addEventListener('click', chooseLibraryFolder);
   // Упрощённые анимации: сохраняются в настройках; включаются автоматически при системной настройке «уменьшить движение».
-  const LITE_MOTION_KEY = 'crimson.mobile.lite-motion';
   function applyLiteMotion(enabled) { document.documentElement.classList.toggle('lite-motion', Boolean(enabled)); }
   (function initLiteMotion() {
     let stored = null;
@@ -2222,7 +2274,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     applyLiteMotion(enabled);
     const toggle = $('#liteMotion');
     toggle.checked = enabled;
-    toggle.addEventListener('change', () => { try { localStorage.setItem(LITE_MOTION_KEY, toggle.checked ? '1' : '0'); } catch (_) {} applyLiteMotion(toggle.checked); });
+    toggle.addEventListener('change', () => { try { localStorage.setItem(LITE_MOTION_KEY, toggle.checked ? '1' : '0'); } catch (_) {} applyLiteMotion(toggle.checked); scheduleBackup(); });
   })();
 
   const concurrencySelect = $('#downloadConcurrency');
@@ -2231,6 +2283,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     const value = clampConcurrency(concurrencySelect.value);
     try { localStorage.setItem(STORAGE_KEYS.downloadConcurrency, String(value)); } catch (_) {}
     downloadQueue.setConcurrency(value);
+    scheduleBackup();
   });
   document.querySelectorAll('.scan-cancel').forEach((button) => button.addEventListener('click', () => { void cancelLibraryScan(); }));
   $('#exportPlaylists').addEventListener('click', () => { void exportPlaylistsFile(); });
@@ -3174,31 +3227,48 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     try { folders = ((await plugin.readPlaylistFolders()) || {}).folders || []; } catch (_) { return 0; }
     if (!folders.length) return 0;
     let found = playlistsFromFolders(folders, state.tracks, state.playlists);
-    if (!found.playlists.length) { const synced = readFolderSynced(); Object.assign(synced, found.synced); writeFolderSynced(synced); return 0; }
-    // Треки, которых нет в библиотеке (оригиналов нет в сканируемой папке), добавляем из самой папки плейлиста.
-    const need = Array.from(new Set(found.unresolved.map((item) => item.file.sourceId)));
+    // Файлы, вручную добавленные в папку плейлиста, импортируем один раз в общую библиотеку.
+    // Сами плейлистные папки больше не получают копии треков: состав хранится в манифесте.
+    const need = Array.from(new Set(found.unresolved.map((item) => item.file && item.file.sourceId).filter(Boolean)));
     const fileTracks = new Map();
     if (need.length && typeof plugin.ingestPlaylistFiles === 'function') {
       try {
         const rows = ((await plugin.ingestPlaylistFiles({ sourceIds: need })) || {}).rows || [];
+        const bySource = new Map(found.unresolved.map((item) => [String(item.file.sourceId), item.file.name]));
         const records = rows.map((row) => folderRecordFromRow(row, null));
         if (records.length) {
           await putRecords(records);
           state.tracks = state.tracks.concat(records.map(attachUrl));
           notifyLibraryChanged({ skipReconcile: true });
         }
-        const byName = new Map(found.unresolved.map((item) => [item.file.sourceId, item.file.name]));
-        records.forEach((record) => { const name = byName.get(record.sourceId); if (name) fileTracks.set(String(name).toLocaleLowerCase(), record.id); });
+        records.forEach((record) => {
+          const name = bySource.get(String(record.sourceId));
+          fileTracks.set(String(record.sourceId), record.id);
+          if (name) fileTracks.set(String(name).toLocaleLowerCase(), record.id);
+        });
       } catch (error) { console.warn('Playlist files ingest failed', error); }
     }
     found = playlistsFromFolders(folders, state.tracks, state.playlists, fileTracks);
-    state.playlists = state.playlists.concat(found.playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) })));
+
+    let addedToExisting = 0;
+    for (const addition of found.additions || []) {
+      const playlist = playlistById(addition.playlistId);
+      if (!playlist) continue;
+      const before = playlist.trackIds.length;
+      playlist.trackIds = uniqueTrackIds(playlist.trackIds.concat(addition.trackIds || []));
+      addedToExisting += playlist.trackIds.length - before;
+    }
+    const restored = found.playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) }));
+    state.playlists = state.playlists.concat(restored);
+
     const synced = readFolderSynced();
-    for (const playlist of found.playlists) synced[playlist.id] = found.synced[playlist.id] || { folderName: playlist.name, sig: '' };
+    Object.assign(synced, found.synced);
     writeFolderSynced(synced);
-    savePlaylists(); render();
-    if (!silent || found.playlists.length) showToast('Восстановлено плейлистов из папки: ' + found.playlists.length + '.');
-    return found.playlists.length;
+    const changed = restored.length > 0 || addedToExisting > 0;
+    if (changed) { savePlaylists(); render(); }
+    else scheduleFolderSync(); // also runs the one-time reference-only migration for old folders
+    if (!silent || changed) showToast('Восстановлено плейлистов: ' + restored.length + '; добавлено треков: ' + addedToExisting + '.');
+    return restored.length;
   }
 
   // ===== Автоматическое сканирование папки: фоновый поток в Java, пачки событий, отмена =====
@@ -3333,20 +3403,28 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     if (plugin && typeof plugin.cancelLibraryScan === 'function') { try { await plugin.cancelLibraryScan(); } catch (_) {} }
   }
 
+  async function restoreNativeBackupIfEmpty() {
+    if (state.playlists.length) return false;
+    const { best } = pickNewestValidBackup(await readNativeBackups());
+    if (!best) return false;
+    const data = best.snapshot.data;
+    const restored = reconcilePlaylists(Array.isArray(data.playlists) ? data.playlists : [], state.tracks);
+    state.playlists = restored.playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) }));
+    restoreBackupPreferences(data);
+    restoreBackupQueue();
+    savePlaylists();
+    render();
+    showToast('Найдена резервная копия: восстановлены данные Crimson (' + state.playlists.length + ' плейлистов).');
+    return true;
+  }
+
   async function chooseLibraryFolder() {
     if (!nativeYtDlp()) { showToast('Выбор папки доступен только в установленном APK.'); return; }
     try {
       const wasSelected = Boolean((await window.CrimsonYtDlp.folderStatus()).hasLibraryFolder);
       await window.CrimsonYtDlp.chooseLibraryFolder(); // путь сохраняется нативным слоем
-      // После переустановки в выбранной папке может лежать резервная копия плейлистов.
-      if (!state.playlists.length) {
-        const { best } = pickNewestValidBackup(await readNativeBackups());
-        if (best && best.snapshot.data.playlists.length) {
-          state.playlists = reconcilePlaylists(best.snapshot.data.playlists, state.tracks).playlists.map((item) => ({ ...item, trackIds: uniqueTrackIds(item.trackIds) }));
-          savePlaylists();
-          showToast('Найдена резервная копия: плейлисты восстановлены (' + state.playlists.length + ').');
-        }
-      }
+      // После переустановки в выбранной папке может лежать резервная копия.
+      await restoreNativeBackupIfEmpty();
       // Автоматический запуск: уже добавленная папка обновляется без дубликатов (инкрементально).
       await refreshExternalLibrary({ silent: true, force: true });
       if (wasSelected) showToast('Папка уже была добавлена: библиотека обновляется без дубликатов.');
@@ -3357,9 +3435,10 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     if (!nativeYtDlp()) { showToast('Выбор папки доступен только в установленном APK.'); return; }
     try {
       await window.CrimsonYtDlp.chooseDownloadFolder();
+      await restoreNativeBackupIfEmpty();
       await refreshFolderSettings();
       showToast('Папка загрузок сохранена.');
-    } catch (error) { if (!String(error?.message || error).toLowerCase().includes('отмен')) showToast('Не удалось выбрать папку: ' + (error?.message || error)); }
+    } catch (error) { if (!String(error?.message || error).toLowerCase().includes('отмен')) showToast('Не удалось выбрать папку загрузок: ' + (error?.message || error)); }
   }
 
   async function resetDownloadFolder() {

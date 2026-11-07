@@ -19,7 +19,9 @@ export function createDownloadQueue({ concurrency = DEFAULT_CONCURRENCY, run, on
 
   const emit = (id) => { try { onChange(id, snapshotOf(id)); } catch (_) {} };
   const snapshotOf = (id) => { const entry = jobs.get(id); return entry ? { id, state: entry.state, error: entry.error || null } : null; };
-  const running = () => [...jobs.values()].filter((entry) => entry.state === 'running').length;
+  // A native cancellation is asynchronous: until run() settles, the worker still owns a slot.
+  // Counting `cancelling` prevents a burst of cancel/add actions from exceeding the limit.
+  const running = () => [...jobs.values()].filter((entry) => entry.state === 'running' || entry.state === 'cancelling').length;
 
   function pump() {
     while (running() < limit && waiting.length) {
@@ -44,7 +46,7 @@ export function createDownloadQueue({ concurrency = DEFAULT_CONCURRENCY, run, on
   function add(job) {
     const id = String(job && job.id);
     const existing = jobs.get(id);
-    if (existing && (existing.state === 'queued' || existing.state === 'running')) return existing.promise;
+    if (existing && (existing.state === 'queued' || existing.state === 'running' || existing.state === 'cancelling')) return existing.promise;
     const entry = { id, job, state: 'queued', cancelled: false, signal: { cancelled: false } };
     entry.promise = new Promise((resolve) => { entry.settle = (e) => resolve({ id, state: e.state, result: e.result, error: e.error || null }); });
     jobs.set(id, entry);

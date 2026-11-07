@@ -36,16 +36,20 @@ import org.json.JSONObject;
 import org.json.JSONArray;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FileInputStream;
+import java.io.InputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Locale;
 import java.util.Collections;
 import java.util.Set;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.regex.Matcher;
@@ -538,19 +542,33 @@ public class YtDlpPlugin extends Plugin {
         }
     }
 
-    private void copyLocalFileToDocument(File source, DocumentFile target) throws Exception {
-        try (java.io.InputStream in = new java.io.FileInputStream(source);
-             OutputStream out = getContext().getContentResolver().openOutputStream(target.getUri(), "w")) {
-            if (out == null) throw new IllegalStateException("Не удалось открыть файл для записи.");
-            byte[] buffer = new byte[64 * 1024];
-            int count;
-            while ((count = in.read(buffer)) != -1) out.write(buffer, 0, count);
+    /** Сверяет содержимое старой копии с каноническим файлом, чтобы удалять только точные дубликаты. */
+    private boolean sameDocumentContent(DocumentFile document, File source) {
+        if (document == null || source == null || !source.isFile()) return false;
+        long documentLength = document.length();
+        if (documentLength <= 0L || documentLength != source.length()) return false;
+        try {
+            MessageDigest left = MessageDigest.getInstance("SHA-256");
+            MessageDigest right = MessageDigest.getInstance("SHA-256");
+            try (InputStream in = getContext().getContentResolver().openInputStream(document.getUri());
+                 InputStream sourceIn = new FileInputStream(source)) {
+                if (in == null) return false;
+                byte[] buffer = new byte[64 * 1024];
+                int count;
+                while ((count = in.read(buffer)) != -1) left.update(buffer, 0, count);
+                while ((count = sourceIn.read(buffer)) != -1) right.update(buffer, 0, count);
+            }
+            return java.util.Arrays.equals(left.digest(), right.digest());
+        } catch (Exception error) {
+            Log.w(TAG, "Could not verify legacy playlist duplicate", error);
+            return false;
         }
     }
 
     /**
-     * Создаёт/обновляет папку плейлиста: копирует недостающие треки, удаляет из папки только те файлы,
-     * которые Crimson скопировал сам (список managed в манифесте), и записывает манифест с порядком.
+     * Создаёт папку плейлиста и записывает манифест-ссылки. Аудио не копируется:
+     * SAF/DocumentFile не предоставляет переносимый механизм hard link или symlink.
+     * Старые управляемые копии удаляются только после побайтовой проверки с оригиналом.
      */
     @PluginMethod
     public void syncPlaylistFolder(PluginCall call) {
@@ -570,35 +588,37 @@ public class YtDlpPlugin extends Plugin {
                 DocumentFile dir = root.findFile(folderName);
                 if (dir == null || !dir.isDirectory()) dir = root.createDirectory(folderName);
                 if (dir == null) throw new IllegalStateException("Не удалось создать папку плейлиста.");
-                Set<String> managed = readManagedNames(dir);
-                Set<String> wanted = new java.util.LinkedHashSet<>();
-                int copied = 0;
+
+                Map<String, File> canonicalByName = new java.util.HashMap<>();
                 if (files != null) {
                     for (int i = 0; i < files.length(); i++) {
                         JSONObject item = files.getJSONObject(i);
                         String name = item.optString("fileName", "");
-                        File source = new File(item.optString("path", ""));
-                        if (name.isEmpty()) continue;
-                        wanted.add(name);
-                        if (dir.findFile(name) != null) continue;           // уже лежит в папке
-                        if (!source.isFile()) continue;                      // исходник недоступен — пропускаем, трек останется в манифесте
-                        DocumentFile target = dir.createFile(mimeForAudioName(name), name);
-                        if (target == null) continue;
-                        try { copyLocalFileToDocument(source, target); managed.add(name); copied++; }
-                        catch (Exception copyError) { target.delete(); Log.w(TAG, "Playlist copy failed: " + name, copyError); }
+                        String path = item.optString("path", "");
+                        if (!name.isEmpty() && !path.isEmpty()) canonicalByName.put(name.toLowerCase(Locale.ROOT), new File(path));
                     }
                 }
-                for (String name : new ArrayList<>(managed)) {
-                    if (wanted.contains(name)) continue;
-                    DocumentFile stale = dir.findFile(name);
-                    if (stale != null) stale.delete();
-                    managed.remove(name);
+
+                // Миграция со старой версии: ранее Crimson копировал аудио в каждую папку.
+                // Удаляем только собственные копии, содержимое которых точно совпадает с оригиналом.
+                int cleaned = 0;
+                Set<String> legacyManaged = readManagedNames(dir);
+                for (String name : legacyManaged) {
+                    DocumentFile legacy = dir.findFile(name);
+                    File source = canonicalByName.get(name.toLowerCase(Locale.ROOT));
+                    if (legacy != null && source != null && sameDocumentContent(legacy, source) && legacy.delete()) cleaned++;
                 }
+
                 JSONObject manifest = new JSONObject(manifestText);
-                manifest.put("managed", new JSONArray(managed));
+                manifest.put("schema", 2);
+                // Ни один аудиофайл этой папки больше не считается принадлежащим Crimson.
+                // Файлы, добавленные пользователем вручную, сохраняются и подхватываются при восстановлении.
+                manifest.put("managed", new JSONArray());
                 writeDocumentText(dir, PLAYLIST_MANIFEST, manifest.toString());
                 JSObject result = new JSObject();
-                result.put("copied", copied);
+                result.put("copied", 0);
+                result.put("cleanedDuplicates", cleaned);
+                result.put("linked", canonicalByName.size());
                 call.resolve(result);
             } catch (Exception ex) {
                 call.reject("Не удалось сохранить плейлист в папку: " + safeMessage(ex));
@@ -606,13 +626,8 @@ public class YtDlpPlugin extends Plugin {
         });
     }
 
-    /** Удаляет манифест и скопированные Crimson файлы; чужие файлы в папке не трогаются. */
+    /** Удаляет только манифест плейлиста. Аудиофайлы — пользовательские данные и не удаляются. */
     private void deletePlaylistDirectory(DocumentFile dir) {
-        Set<String> managed = readManagedNames(dir);
-        for (String name : managed) {
-            DocumentFile file = dir.findFile(name);
-            if (file != null) file.delete();
-        }
         DocumentFile manifest = dir.findFile(PLAYLIST_MANIFEST);
         if (manifest != null) manifest.delete();
         DocumentFile[] rest = dir.listFiles();
@@ -733,8 +748,15 @@ public class YtDlpPlugin extends Plugin {
         final String json = call.getString("json", "");
         executor.execute(() -> {
             try {
-                BackupStore.save(getContext(), json);   // только приватная копия; плейлисты с музыкой лежат в папках «Crimson Playlists»
-                call.resolve(new JSObject());
+                BackupStore.save(getContext(), json); // атомарная приватная копия + ротация истории
+                String libraryTree = storagePrefs().getString(LIBRARY_TREE_URI, "");
+                String downloadTree = storagePrefs().getString(DOWNLOAD_TREE_URI, "");
+                boolean mirroredToLibrary = BackupStore.mirror(getContext(), libraryTree, json);
+                boolean mirroredToDownloads = BackupStore.mirror(getContext(), downloadTree, json);
+                JSObject result = new JSObject();
+                result.put("mirroredToLibrary", mirroredToLibrary);
+                result.put("mirroredToDownloads", mirroredToDownloads);
+                call.resolve(result);
             } catch (Exception ex) {
                 call.reject("Не удалось сохранить резервную копию: " + safeMessage(ex));
             }
@@ -745,7 +767,9 @@ public class YtDlpPlugin extends Plugin {
     public void readBackups(PluginCall call) {
         executor.execute(() -> {
             JSArray backups = new JSArray();
-            for (String[] item : BackupStore.readAllCandidates(getContext(), "", "")) {
+            String libraryTree = storagePrefs().getString(LIBRARY_TREE_URI, "");
+            String downloadTree = storagePrefs().getString(DOWNLOAD_TREE_URI, "");
+            for (String[] item : BackupStore.readAllCandidates(getContext(), libraryTree, downloadTree)) {
                 JSObject entry = new JSObject();
                 entry.put("source", item[0]);
                 entry.put("text", item[1]);
