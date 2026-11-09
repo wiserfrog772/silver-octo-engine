@@ -487,21 +487,18 @@ public class YtDlpPlugin extends Plugin {
     }
 
 
-    // ===== Плейлисты как папки: «Crimson Playlists/<название>/» с музыкой и манифестом =====
+    // ===== Плейлисты как отдельные папки «Название [ID]» прямо в выбранном корне =====
     private static final String PLAYLISTS_DIR = "Crimson Playlists";
     private static final String PLAYLIST_MANIFEST = "crimson-playlist.json";
 
-    /** Корневая папка плейлистов внутри выбранной пользователем папки (медиатека, затем загрузки). */
+    /** Папки плейлистов создаются прямо в выбранном корне, без дополнительной вложенной директории. */
     private DocumentFile playlistsRoot(boolean create) {
         for (String key : new String[] {LIBRARY_TREE_URI, DOWNLOAD_TREE_URI}) {
             String tree = storagePrefs().getString(key, "");
             if (tree == null || tree.isEmpty()) continue;
             try {
                 DocumentFile root = DocumentFile.fromTreeUri(getContext(), Uri.parse(tree));
-                if (root == null || !root.isDirectory() || !root.canWrite()) continue;
-                DocumentFile dir = root.findFile(PLAYLISTS_DIR);
-                if ((dir == null || !dir.isDirectory()) && create) dir = root.createDirectory(PLAYLISTS_DIR);
-                if (dir != null && dir.isDirectory()) return dir;
+                if (root != null && root.isDirectory() && root.canWrite()) return root;
             } catch (Exception ignored) { /* пробуем следующую папку */ }
         }
         return null;
@@ -580,7 +577,7 @@ public class YtDlpPlugin extends Plugin {
         executor.execute(() -> {
             try {
                 DocumentFile root = playlistsRoot(true);
-                if (root == null) { call.reject("Выбери папку с музыкой или загрузок в настройках: в ней появится «" + PLAYLISTS_DIR + "»."); return; }
+                if (root == null) { call.reject("Выбери папку медиатеки или загрузок в настройках."); return; }
                 if (!previousName.isEmpty() && !previousName.equals(folderName)) {
                     DocumentFile old = root.findFile(previousName);
                     if (old != null && old.isDirectory() && root.findFile(folderName) == null) old.renameTo(folderName);
@@ -599,9 +596,25 @@ public class YtDlpPlugin extends Plugin {
                     }
                 }
 
-                // Миграция со старой версии: ранее Crimson копировал аудио в каждую папку.
-                // Удаляем только собственные копии, содержимое которых точно совпадает с оригиналом.
+                // Миграция со старой версии: папки раньше находились в Crimson Playlists/<name>.
+                // Удаляем старые копии только по прежнему manifest.managed и после SHA-256 проверки.
                 int cleaned = 0;
+                DocumentFile oldContainer = root.findFile(PLAYLISTS_DIR);
+                if (oldContainer != null && oldContainer.isDirectory() && !previousName.isEmpty()) {
+                    DocumentFile oldDir = oldContainer.findFile(previousName);
+                    if (oldDir != null && oldDir.isDirectory()) {
+                        for (String oldName : readManagedNames(oldDir)) {
+                            DocumentFile oldCopy = oldDir.findFile(oldName);
+                            File source = canonicalByName.get(oldName.toLowerCase(Locale.ROOT));
+                            if (oldCopy != null && source != null && sameDocumentContent(oldCopy, source) && oldCopy.delete()) cleaned++;
+                        }
+                        DocumentFile oldManifest = oldDir.findFile(PLAYLIST_MANIFEST);
+                        if (oldManifest != null) oldManifest.delete();
+                        DocumentFile[] remaining = oldDir.listFiles();
+                        if (remaining == null || remaining.length == 0) oldDir.delete();
+                    }
+                }
+                // Удаляем старые управляемые копии и в уже мигрированной папке.
                 Set<String> legacyManaged = readManagedNames(dir);
                 for (String name : legacyManaged) {
                     DocumentFile legacy = dir.findFile(name);
@@ -641,12 +654,25 @@ public class YtDlpPlugin extends Plugin {
             try {
                 DocumentFile root = playlistsRoot(false);
                 DocumentFile dir = root == null || folderName.isEmpty() ? null : root.findFile(folderName);
-                if (dir != null && dir.isDirectory()) deletePlaylistDirectory(dir);
+                if (dir == null && root != null && !folderName.isEmpty()) {
+                    DocumentFile legacyRoot = root.findFile(PLAYLISTS_DIR);
+                    if (legacyRoot != null && legacyRoot.isDirectory()) dir = legacyRoot.findFile(folderName);
+                }
+                if (dir != null && dir.isDirectory() && dir.findFile(PLAYLIST_MANIFEST) != null) deletePlaylistDirectory(dir);
                 call.resolve();
             } catch (Exception ex) {
                 call.reject("Не удалось удалить папку плейлиста: " + safeMessage(ex));
             }
         });
+    }
+
+    private void deleteManagedPlaylistDirectories(DocumentFile parent) {
+        DocumentFile[] children = parent.listFiles();
+        if (children == null) return;
+        for (DocumentFile child : children) {
+            if (child == null || !child.isDirectory()) continue;
+            if (child.findFile(PLAYLIST_MANIFEST) != null) deletePlaylistDirectory(child);
+        }
     }
 
     @PluginMethod
@@ -655,9 +681,13 @@ public class YtDlpPlugin extends Plugin {
             try {
                 DocumentFile root = playlistsRoot(false);
                 if (root != null) {
-                    for (DocumentFile child : root.listFiles()) if (child.isDirectory()) deletePlaylistDirectory(child);
-                    DocumentFile[] rest = root.listFiles();
-                    if (rest == null || rest.length == 0) root.delete();
+                    deleteManagedPlaylistDirectories(root);
+                    DocumentFile legacyRoot = root.findFile(PLAYLISTS_DIR);
+                    if (legacyRoot != null && legacyRoot.isDirectory()) {
+                        deleteManagedPlaylistDirectories(legacyRoot);
+                        DocumentFile[] legacyRest = legacyRoot.listFiles();
+                        if (legacyRest == null || legacyRest.length == 0) legacyRoot.delete();
+                    }
                 }
                 call.resolve();
             } catch (Exception ex) {
@@ -666,7 +696,7 @@ public class YtDlpPlugin extends Plugin {
         });
     }
 
-    /** Папки плейлистов с манифестами и списком аудиофайлов: для восстановления после переустановки. */
+    /** Читает новые папки в корне и старые Crimson Playlists/* для обратной совместимости. */
     @PluginMethod
     public void readPlaylistFolders(PluginCall call) {
         executor.execute(() -> {
@@ -674,30 +704,9 @@ public class YtDlpPlugin extends Plugin {
             try {
                 DocumentFile root = playlistsRoot(false);
                 if (root != null) {
-                    for (DocumentFile dir : root.listFiles()) {
-                        if (dir == null || !dir.isDirectory()) continue;
-                        DocumentFile manifest = dir.findFile(PLAYLIST_MANIFEST);
-                        if (manifest == null) continue;
-                        String text;
-                        try (java.io.InputStream in = getContext().getContentResolver().openInputStream(manifest.getUri())) {
-                            text = in == null ? "" : BackupStore.readAll(in);
-                        } catch (Exception unreadable) { continue; }
-                        JSArray audio = new JSArray();
-                        for (DocumentFile file : dir.listFiles()) {
-                            if (file == null || !file.isFile() || !isAudioDocument(file)) continue;
-                            JSObject item = new JSObject();
-                            item.put("name", file.getName());
-                            item.put("sourceId", file.getUri().toString());
-                            item.put("size", file.length());
-                            item.put("lastModified", file.lastModified());
-                            audio.put(item);
-                        }
-                        JSObject entry = new JSObject();
-                        entry.put("dirName", dir.getName());
-                        entry.put("manifest", text);
-                        entry.put("files", audio);
-                        folders.put(entry);
-                    }
+                    appendPlaylistFolders(root, folders);
+                    DocumentFile legacyRoot = root.findFile(PLAYLISTS_DIR);
+                    if (legacyRoot != null && legacyRoot.isDirectory()) appendPlaylistFolders(legacyRoot, folders);
                 }
             } catch (Exception ex) {
                 Log.w(TAG, "readPlaylistFolders failed", ex);
@@ -706,6 +715,36 @@ public class YtDlpPlugin extends Plugin {
             result.put("folders", folders);
             call.resolve(result);
         });
+    }
+
+    private void appendPlaylistFolders(DocumentFile parent, JSArray folders) throws Exception {
+        DocumentFile[] dirs = parent.listFiles();
+        if (dirs == null) return;
+        for (DocumentFile dir : dirs) {
+            if (dir == null || !dir.isDirectory()) continue;
+            DocumentFile manifest = dir.findFile(PLAYLIST_MANIFEST);
+            if (manifest == null) continue;
+            String text;
+            try (java.io.InputStream in = getContext().getContentResolver().openInputStream(manifest.getUri())) {
+                text = in == null ? "" : BackupStore.readAll(in);
+            } catch (Exception unreadable) { continue; }
+            JSArray audio = new JSArray();
+            DocumentFile[] children = dir.listFiles();
+            if (children != null) for (DocumentFile file : children) {
+                if (file == null || !file.isFile() || !isAudioDocument(file)) continue;
+                JSObject item = new JSObject();
+                item.put("name", file.getName());
+                item.put("sourceId", file.getUri().toString());
+                item.put("size", file.length());
+                item.put("lastModified", file.lastModified());
+                audio.put(item);
+            }
+            JSObject entry = new JSObject();
+            entry.put("dirName", dir.getName());
+            entry.put("manifest", text);
+            entry.put("files", audio);
+            folders.put(entry);
+        }
     }
 
     /** Файлы из папок плейлистов, которых нет в библиотеке: готовим их так же, как при сканировании. */
@@ -928,9 +967,9 @@ public class YtDlpPlugin extends Plugin {
             if (scanCancelled.get()) return;
             if (child == null) continue;
             if (child.isDirectory()) {
-                // Папки плейлистов содержат копии треков: в библиотеку они не добавляются, чтобы не было дубликатов
-                // и чтобы удаление плейлиста не могло затронуть файл, на который ссылается библиотека.
-                if (PLAYLISTS_DIR.equals(child.getName())) continue;
+                // Старый контейнер и новые папки плейлистов не сканируем как отдельные источники.
+                // Ручной импорт из папки плейлиста обрабатывается restorePlaylistsFromFolders().
+                if (PLAYLISTS_DIR.equals(child.getName()) || child.findFile(PLAYLIST_MANIFEST) != null) continue;
                 collectAudioDocuments(child, output);
             }
             else if (child.isFile() && isAudioDocument(child)) output.add(child);

@@ -282,3 +282,38 @@ test('анимации: нет анимации layout-свойств, нет co
   assert.match(css, /html\.lite-motion/);
   assert.match(read('www/index.html'), /id="liteMotion"/);
 });
+
+
+test('сканирование ждёт асинхронную регистрацию Capacitor listener до старта нативного потока', () => {
+  const app = read('www/app.js');
+  assert.match(app, /await attachScanListener\(\);\s*const started = await plugin\.startLibraryScan/);
+  assert.match(app, /Promise\.resolve\(plugin\.addListener\('libraryScanEvent'/);
+});
+
+test('папки плейлистов создаются автоматически, без ручных кнопок в настройках', () => {
+  const html = read('www/index.html');
+  const app = read('www/app.js');
+  const java = read('native/android/app/src/main/java/com/localify/crimson/YtDlpPlugin.java');
+  assert.doesNotMatch(html, /id="(?:syncPlaylistFolders|restorePlaylistFolders)"/);
+  assert.doesNotMatch(app, /\$\('#(?:syncPlaylistFolders|restorePlaylistFolders)'\)/);
+  assert.match(app, /function savePlaylists\(\)[\s\S]*?scheduleFolderSync\(\)/);
+  assert.match(java, /private DocumentFile playlistsRoot\(boolean create\)[\s\S]*?return root;/);
+  assert.match(java, /appendPlaylistFolders\(root, folders\)/);
+  assert.match(java, /appendPlaylistFolders\(legacyRoot, folders\)/);
+  assert.match(java, /child\.findFile\(PLAYLIST_MANIFEST\) != null/);
+});
+
+
+test('очередь загрузок отображает статусы и ожидает регистрацию событий до запуска', () => {
+  const app = read('www/app.js');
+  assert.match(app, /onChange: \(id, snapshot\) =>/);
+  assert.match(app, /await attachDownloadProgressListener\(\);/);
+  assert.match(app, /async function enqueueYoutubeDownload\(video\)/);
+});
+
+test('удаление папок плейлистов никогда не удаляет выбранный корень пользователя', () => {
+  const java = read('native/android/app/src/main/java/com/localify/crimson/YtDlpPlugin.java');
+  const block = java.slice(java.indexOf('public void deleteAllPlaylistFolders'), java.indexOf('public void readPlaylistFolders'));
+  assert.match(block, /deleteManagedPlaylistDirectories\(root\)/);
+  assert.doesNotMatch(block, /root\.delete\(\)/);
+});

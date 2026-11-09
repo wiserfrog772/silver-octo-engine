@@ -40,12 +40,14 @@ test('синхронизация: создание, обновление при 
   plan = f.planFolderSync(synced, [pl({ trackIds: ['t2', 't1'] })], byId);
   assert.equal(plan.upsert.length, 1, 'порядок изменился');
   plan = f.planFolderSync(synced, [pl({ name: 'Новое имя' })], byId);
-  assert.equal(plan.upsert[0].previousName, 'Любимое', 'переименование передаёт прежнюю папку');
+  assert.equal(plan.upsert[0].previousName, f.playlistFolderName(pl()), 'переименование передаёт прежнюю папку с тем же ID');
   plan = f.planFolderSync(synced, [], byId);
-  assert.deepEqual(plan.remove, [{ id: 'p1', folderName: 'Любимое' }]);
+  assert.deepEqual(plan.remove, [{ id: 'p1', folderName: f.playlistFolderName(pl()) }]);
   // одинаковые названия плейлистов → разные папки
   const two = f.planFolderSync({}, [pl(), pl({ id: 'p2' })], byId);
-  assert.deepEqual(two.upsert.map((u) => u.state.folderName), ['Любимое', 'Любимое (2)']);
+  assert.match(two.upsert[0].state.folderName, /^Любимое \[([0-9a-f]{8})\]$/);
+  assert.match(two.upsert[1].state.folderName, /^Любимое \[([0-9a-f]{8})\]$/);
+  assert.notEqual(two.upsert[0].state.folderName, two.upsert[1].state.folderName);
 });
 
 test('восстановление после переустановки: плейлисты, порядок и привязка к библиотеке', () => {
@@ -102,4 +104,12 @@ test('ручной аудиофайл в существующей папке и�
 test('имя файла из папки разбирается теми же правилами, что и библиотека', () => {
   assert.deepEqual(f.identityForFolderFile({ name: 'Wiz Khalifa feat. Charlie Puth - See You Again.mp3' }), { name: 'See You Again', artist: 'Wiz Khalifa feat. Charlie Puth' });
   assert.deepEqual(f.identityForFolderFile({ name: 'Просто файл.mp3' }), { name: 'Просто файл', artist: 'Неизвестный исполнитель' });
+});
+
+test('имя физической папки содержит понятное имя и стабильный восьмизначный ID', () => {
+  const playlist = { id: '06889c86', name: 'electrodnbjungle' };
+  const name = f.playlistFolderName(playlist);
+  assert.match(name, /^electrodnbjungle \[([0-9a-f]{8})\]$/);
+  assert.equal(name, f.playlistFolderName(playlist));
+  assert.notEqual(name, f.playlistFolderName({ ...playlist, id: 'another-id' }));
 });

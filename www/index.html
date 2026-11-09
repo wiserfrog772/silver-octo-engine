@@ -62,7 +62,7 @@
           <div><div class="eyebrow">НАСТРОЙКИ ХРАНИЛИЩА</div><h2>Настройки</h2></div>
         </div>
         <article class="settings-card">
-          <div class="settings-card-title"><span class="settings-symbol">♫</span><div><h3>Источник медиатеки</h3><p>Выбери папку с музыкой. Скачанные в Crimson треки автоматически добавляются в медиатеку, а копии можно экспортировать в выбранную папку.</p></div></div>
+          <div class="settings-card-title"><span class="settings-symbol">♫</span><div><h3>Источник медиатеки</h3><p>Выбери папку с музыкой. Crimson просканирует её и будет автоматически обновлять медиатеку при повторном сканировании.</p></div></div>
           <div id="libraryFolderSummary" class="settings-status">Папка не выбрана. Используется медиатека, добавленная вручную или скачанная в приложении.</div>
           <div class="settings-actions">
             <button id="chooseLibraryFolder" type="button" class="primary-button">Выбрать папку</button>
@@ -78,11 +78,9 @@
           </div>
         </article>
         <article class="settings-card">
-          <div class="settings-card-title"><span class="settings-symbol">⛨</span><div><h3>Плейлисты и резервные копии</h3><p>Каждый плейлист хранится как папка «Crimson Playlists/название» внутри выбранной папки: в ней лежат треки и порядок воспроизведения. После переустановки выбери ту же папку — плейлисты вернутся вместе с музыкой. Треки копируются в папку плейлиста, поэтому занимают место дважды.</p></div></div>
+          <div class="settings-card-title"><span class="settings-symbol">⛨</span><div><h3>Резервные копии</h3><p>Резервные копии защищают библиотеку и настройки. Папки плейлистов создаются и обновляются автоматически.</p></div></div>
           <div id="dataStatus" class="settings-status">Резервная копия создаётся автоматически после изменений.</div>
           <div class="settings-actions">
-            <button id="syncPlaylistFolders" type="button" class="primary-button">Записать плейлисты в папки</button>
-            <button id="restorePlaylistFolders" type="button" class="secondary-button">Найти плейлисты в папке</button>
             <button id="backupNow" type="button" class="secondary-button">Создать копию сейчас</button>
             <button id="restoreBackup" type="button" class="secondary-button">Восстановить из копии</button>
             <button id="restoreBackupFile" type="button" class="secondary-button">Восстановить из файла…</button>

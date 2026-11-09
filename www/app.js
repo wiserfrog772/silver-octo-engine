@@ -79,12 +79,12 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     toastTimer: null,
     seekDragging: false,
     pendingSeekTime: null,
-    downloadListenerAttached: false,
+    downloadListenerAttached: false, downloadListenerPromise: null,
     libraryRefreshing: false,
     libraryRefreshRequested: false,
     libraryRefreshRequestedSilent: true,
     lastFolderScanAt: 0,
-    scan: createScanState(), scanSeen: null, scanListenerAttached: false, scanAdded: 0,
+    scan: createScanState(), scanSeen: null, scanListenerAttached: false, scanListenerPromise: null, scanAdded: 0,
     allowEmptyBackup: false, renderLimit: 150, libraryDirty: true, backupTimer: null, lastBackupAt: 0, backupStatus: '',
     lastMediaMetadataKey: '',
     lastMediaPlaybackState: '',
@@ -1139,7 +1139,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   }
 
   async function wipeAllUserData() {
-    if (!window.confirm('Удалить ВСЕ данные Crimson: плейлисты (включая папки «Crimson Playlists» с их копиями треков), настройки, медиатеку и резервные копии? Это действие нельзя отменить.')) return;
+    if (!window.confirm('Удалить ВСЕ данные Crimson: плейлисты (включая созданные папки плейлистов), настройки, медиатеку и резервные копии? Это действие нельзя отменить.')) return;
     if (!window.confirm('Точно удалить всё? Файлы музыки в выбранных папках останутся нетронутыми.')) return;
     try {
       const plugin = window.CrimsonYtDlp;
@@ -2292,8 +2292,6 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   $('#restoreBackup').addEventListener('click', () => { void restoreFromBackup(); });
   $('#restoreBackupFile').addEventListener('click', () => { void restoreFromChosenFile(); });
   $('#checkIntegrity').addEventListener('click', () => { void runIntegrityCheck(); });
-  $('#syncPlaylistFolders').addEventListener('click', () => { void syncPlaylistFolders({ force: true }); });
-  $('#restorePlaylistFolders').addEventListener('click', async () => { const n = await restorePlaylistsFromFolders({ silent: false }); if (!n) showToast('Новых плейлистов в папке не найдено.'); });
   $('#repairMetadata').addEventListener('click', () => { void repairLibraryMetadata(); });
   $('#undoMetadataRepair').addEventListener('click', () => { void undoMetadataRepair(); });
   $('#wipeData').addEventListener('click', () => { void wipeAllUserData(); });
@@ -3176,7 +3174,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     showToast('Прежние названия возвращены.');
   }
 
-  // ===== Плейлисты как папки «Crimson Playlists/<название>» с музыкой =====
+  // ===== Автоматическая синхронизация плейлистов с физическими папками =====
   let folderSyncTimer = null;
   let folderSyncRunning = false;
   let folderSyncAgain = false;
@@ -3209,7 +3207,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
         synced[item.id] = { folderName: item.state.folderName, sig: item.sig };
         writeFolderSynced(synced);
       }
-      if (force) showToast('Плейлисты записаны в папку «Crimson Playlists».');
+      if (force) showToast('Папки плейлистов обновлены.');
     } catch (error) {
       // Чаще всего папка не выбрана: сообщаем один раз за сеанс, а не при каждом изменении.
       if (!folderSyncWarned || force) { folderSyncWarned = true; showToast(String(error && error.message || error)); }
@@ -3272,11 +3270,14 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   }
 
   // ===== Автоматическое сканирование папки: фоновый поток в Java, пачки событий, отмена =====
-  function attachScanListener() {
-    const plugin = window.CrimsonYtDlp;
-    if (!plugin || typeof plugin.addListener !== 'function' || state.scanListenerAttached) return;
-    state.scanListenerAttached = true;
-    plugin.addListener('libraryScanEvent', (event) => { void handleScanEvent(event || {}); });
+  async function attachScanListener() {
+    const plugin = await waitForNativePlugin();
+    if (!plugin || typeof plugin.addListener !== 'function') throw new Error('Нативный модуль сканирования не загружен. Перезапусти приложение или обнови APK.');
+    if (state.scanListenerPromise) return state.scanListenerPromise;
+    state.scanListenerPromise = Promise.resolve(plugin.addListener('libraryScanEvent', (event) => { void handleScanEvent(event || {}); }))
+      .then(() => { state.scanListenerAttached = true; return true; })
+      .catch((error) => { state.scanListenerPromise = null; state.scanListenerAttached = false; throw error; });
+    return state.scanListenerPromise;
   }
 
   function renderScanProgress() {
@@ -3385,11 +3386,12 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     if (!force && state.lastFolderScanAt && Date.now() - state.lastFolderScanAt < 30000) return;
     const plugin = window.CrimsonYtDlp;
     if (typeof plugin.startLibraryScan !== 'function') { if (!state.scanSilent) showToast('Эта версия APK не поддерживает фоновое сканирование.'); return; }
-    attachScanListener();
     state.scanSeen = new Set();
     state.scan = reduceScanEvent(createScanState(), { type: 'start' });
     renderScanProgress();
     try {
+      // Capacitor addListener is asynchronous. Await it before native scan emits its first batch.
+      await attachScanListener();
       const started = await plugin.startLibraryScan({ known: buildKnownSources(state.tracks) });
       if (started && started.selected === false) { state.scan = createScanState(); renderScanProgress(); }
     } catch (error) {
@@ -3419,10 +3421,11 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   }
 
   async function chooseLibraryFolder() {
-    if (!nativeYtDlp()) { showToast('Выбор папки доступен только в установленном APK.'); return; }
+    const plugin = await waitForNativePlugin();
+    if (!plugin || !nativeYtDlp()) { showToast('Выбор папки доступен только в установленном APK.'); return; }
     try {
-      const wasSelected = Boolean((await window.CrimsonYtDlp.folderStatus()).hasLibraryFolder);
-      await window.CrimsonYtDlp.chooseLibraryFolder(); // путь сохраняется нативным слоем
+      const wasSelected = Boolean((await plugin.folderStatus()).hasLibraryFolder);
+      await plugin.chooseLibraryFolder(); // путь сохраняется нативным слоем
       // После переустановки в выбранной папке может лежать резервная копия.
       await restoreNativeBackupIfEmpty();
       // Автоматический запуск: уже добавленная папка обновляется без дубликатов (инкрементально).
@@ -3432,9 +3435,10 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   }
 
   async function chooseDownloadFolder() {
-    if (!nativeYtDlp()) { showToast('Выбор папки доступен только в установленном APK.'); return; }
+    const plugin = await waitForNativePlugin();
+    if (!plugin || !nativeYtDlp()) { showToast('Выбор папки доступен только в установленном APK.'); return; }
     try {
-      await window.CrimsonYtDlp.chooseDownloadFolder();
+      await plugin.chooseDownloadFolder();
       await restoreNativeBackupIfEmpty();
       await refreshFolderSettings();
       showToast('Папка загрузок сохранена.');
@@ -3636,11 +3640,22 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
   const downloadQueue = createDownloadQueue({
     concurrency: readDownloadConcurrency(),
     run: (job) => runYoutubeDownload(job.video),
+    onChange: (id, snapshot) => {
+      if (!snapshot) return;
+      const current = state.ytDownloads[id] || { progress: 0 };
+      if (snapshot.state === 'queued') state.ytDownloads[id] = { ...current, phase: 'queued', status: 'queued' };
+      else if (snapshot.state === 'running' && !ACTIVE_PHASES.has(current.phase)) state.ytDownloads[id] = { ...current, phase: 'extracting', status: 'downloading' };
+      else if (snapshot.state === 'cancelling') state.ytDownloads[id] = { ...current, phase: 'cancelling', status: 'cancelling' };
+      else if (snapshot.state === 'cancelled') state.ytDownloads[id] = { ...current, phase: 'cancelled', status: 'cancelled' };
+      if (state.view === 'youtube') renderOnlineResults();
+    },
     cancelNative: async (id) => { const plugin = window.CrimsonYtDlp; if (plugin && typeof plugin.cancelDownload === 'function') await plugin.cancelDownload({ id }); }
   });
 
-  function enqueueYoutubeDownload(video) {
-    if (!nativeYtDlp()) { showToast('Скачивание доступно в установленном Android APK.'); return; }
+  async function enqueueYoutubeDownload(video) {
+    const plugin = await waitForNativePlugin();
+    if (!plugin || !nativeYtDlp() || typeof plugin.downloadAudio !== 'function') { showToast('Модуль загрузок не готов. Перезапусти Crimson или обнови APK.'); return; }
+    await attachDownloadProgressListener();
     if (downloadQueue.isActive(video.id)) return;   // то же задание не запускается дважды
     state.ytDownloads[video.id] = mergeProgress(null, { phase: 'queued', progress: 0 });
     renderOnlineResults();
@@ -3748,28 +3763,39 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
     try { await window.CrimsonYtDlp.clearCookies(); $('#cookiesStatus').textContent = 'Cookies Crimson удалены.'; ytStatus('cookies.txt удалён.'); }
     catch (error) { ytStatus('Не удалось удалить cookies.txt: ' + (error?.message || error), true); }
   });
-  function attachDownloadProgressListener() {
-    const plugin = window.CrimsonYtDlp;
+  async function attachDownloadProgressListener() {
+    const plugin = await waitForNativePlugin();
     if (!plugin || typeof plugin.addListener !== 'function' || state.downloadListenerAttached) return;
-    state.downloadListenerAttached = true;
-    plugin.addListener('downloadProgress', (event) => {
-      if (!event || !event.id) return;
-      const previous = state.ytDownloads[event.id];
-      if (previous && !ACTIVE_PHASES.has(previous.phase) && previous.status !== 'downloading') return; // запоздавшее событие после завершения
-      const next = mergeProgress(previous, event);
-      const phaseChanged = !previous || previous.phase !== next.phase;
-      state.ytDownloads[event.id] = next;
-      if (event.message) ytStatus(String(event.message));
-      if (state.view !== 'youtube') return;
-      // Обычные события обновляют только полоску этого трека; полная перерисовка — только при смене состояния.
-      if (phaseChanged && !document.querySelector('.dl-progress[data-dl]')) renderOnlineResults();
-      else scheduleProgressUpdate(String(event.id));
+    if (state.downloadListenerPromise) return state.downloadListenerPromise;
+    state.downloadListenerPromise = (async () => {
+      await plugin.addListener('downloadProgress', (event) => {
+        if (!event || !event.id) return;
+        const previous = state.ytDownloads[event.id];
+        if (previous && !ACTIVE_PHASES.has(previous.phase) && previous.status !== 'downloading') return;
+        const next = mergeProgress(previous, event);
+        const phaseChanged = !previous || previous.phase !== next.phase;
+        state.ytDownloads[event.id] = next;
+        if (event.message) ytStatus(String(event.message));
+        if (state.view !== 'youtube') return;
+        if (phaseChanged && !document.querySelector('.dl-progress[data-dl]')) renderOnlineResults();
+        else scheduleProgressUpdate(String(event.id));
+      });
+      await plugin.addListener('downloadPublished', (event) => {
+        if (event && event.ok === false && event.message) showToast(String(event.message));
+      });
+      state.downloadListenerAttached = true;
+      return true;
+    })().catch((error) => {
+      state.downloadListenerPromise = null;
+      state.downloadListenerAttached = false;
+      console.warn('Download listener registration failed', error);
+      return false;
     });
-    plugin.addListener('downloadPublished', (event) => { if (event && event.ok === false && event.message) showToast(String(event.message)); });
+    return state.downloadListenerPromise;
   }
 
   window.addEventListener('crimson-yt-dlp-ready', () => {
-    attachDownloadProgressListener();
+    void attachDownloadProgressListener();
     if (typeof window.CrimsonYtDlp?.addListener === 'function') {
       window.CrimsonYtDlp.addListener('ytDlpUpdate', (event) => {
         const version = event && event.runtimeVersion ? ' · ' + event.runtimeVersion : '';
@@ -3782,7 +3808,7 @@ import { planLibrarySync, buildKnownSources, createScanState, reduceScanEvent, i
 
     if (state.db) void refreshFolderSettings();
   });
-  attachDownloadProgressListener();
+  void attachDownloadProgressListener();
 
   // Avoid a full Android SAF folder scan on every app resume; loading, choosing
   // a source folder, or tapping "Пересканировать" is enough.

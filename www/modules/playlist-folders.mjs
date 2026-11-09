@@ -1,12 +1,19 @@
 /**
- * Плейлисты как папки: «Crimson Playlists/<Название>/» с манифестом-ссылками crimson-playlist.json.
+ * Плейлисты как обычные папки «Название [короткий ID]» прямо в выбранном корне; манифест хранит связи и порядок.
  * Аудио не копируется в каждую подборку. Папка лежит в выбранном пользователем хранилище и переживает
  * переустановку: после выбора той же папки плейлисты восстанавливаются вместе с порядком треков.
  */
 import { hash53, refFromTrack, reconcilePlaylists, normalizePlaylist, buildTrackLookup, resolveTrackRef } from './backup.mjs';
 import { libraryNameFromFilename, stripAudioExtension } from './track-identity.mjs';
 
-export const PLAYLISTS_DIR = 'Crimson Playlists';
+export const PLAYLISTS_DIR = 'Crimson Playlists'; // legacy container, read only during migration
+
+/** Папка плейлиста: читаемое имя + стабильный короткий ID, например Rock [06889c86]. */
+export function playlistFolderName(playlist) {
+  const id = String(playlist && playlist.id || '');
+  const suffix = hash53(id).toString(16).padStart(8, '0').slice(-8);
+  return `${safeName(playlist && playlist.name, 'Плейлист')} [${suffix}]`;
+}
 export const MANIFEST_NAME = 'crimson-playlist.json';
 export const MANIFEST_KIND = 'crimson-playlist';
 const AUDIO_EXT_RE = /\.(mp3|m4a|aac|ogg|opus|wav|flac|webm|oga|mp4|wma|aiff?|alac)$/i;
@@ -60,7 +67,7 @@ export function buildFolderState(playlist, getTrack) {
     id: playlist.id, name: playlist.name, createdAt: playlist.createdAt || 0,
     entries
   };
-  return { name: playlist.name, folderName: safeName(playlist.name, 'Плейлист'), files, manifest, skipped };
+  return { name: playlist.name, folderName: playlistFolderName(playlist), files, manifest, skipped };
 }
 
 export function folderSignature(state) {
@@ -84,9 +91,8 @@ export function planFolderSync(synced, playlists, getTrack) {
   for (const playlist of playlists) {
     seen.add(playlist.id);
     const state = buildFolderState(playlist, getTrack);
-    // одинаковые названия плейлистов получают разные папки
-    const base = state.folderName;
-    state.folderName = uniqueName(base, usedFolders);
+    // ID уже делает имена уникальными даже при одинаковых названиях.
+    state.folderName = uniqueName(state.folderName, usedFolders);
     const sig = folderSignature(state);
     const previous = synced[playlist.id];
     if (previous && previous.sig === sig && previous.folderName === state.folderName) continue;
