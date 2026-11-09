@@ -557,8 +557,38 @@ public final class PlaybackForegroundService extends MediaSessionService {
         player.setShuffleModeEnabled(shuffle);
         player.setRepeatMode(repeat ? Player.REPEAT_MODE_ONE : Player.REPEAT_MODE_OFF);
 
-        // Don't seek/reset an already-playing track when only metadata or queue controls changed.
-        if (!queueUnchanged || !currentUnchanged) {
+        // Appending/removing upcoming tracks must not rebuild ExoPlayer's active item.
+        // Replacing the whole timeline causes an audible micro-pause even when the current
+        // media ID and requested position are unchanged. When the prefix through the current
+        // item is identical, only replace the tail after the current item.
+        boolean samePrefixThroughCurrent = currentUnchanged
+            && startIndex == player.getCurrentMediaItemIndex()
+            && player.getMediaItemCount() > startIndex;
+        if (samePrefixThroughCurrent) {
+            for (int i = 0; i <= startIndex; i++) {
+                MediaItem existing = player.getMediaItemAt(i);
+                MediaItem requested = mediaItems.get(i);
+                if (!existing.mediaId.equals(requested.mediaId)
+                    || existing.localConfiguration == null
+                    || requested.localConfiguration == null
+                    || !existing.localConfiguration.uri.equals(requested.localConfiguration.uri)) {
+                    samePrefixThroughCurrent = false;
+                    break;
+                }
+            }
+        }
+
+        if (!queueUnchanged && samePrefixThroughCurrent) {
+            int tailStart = startIndex + 1;
+            if (player.getMediaItemCount() > tailStart) {
+                player.removeMediaItems(tailStart, player.getMediaItemCount());
+            }
+            if (mediaItems.size() > tailStart) {
+                player.addMediaItems(tailStart, mediaItems.subList(tailStart, mediaItems.size()));
+            }
+            queueSignature = signature;
+            currentTrackId = currentId;
+        } else if (!queueUnchanged || !currentUnchanged) {
             player.setMediaItems(mediaItems, startIndex, Math.max(0L, requestedPositionMs));
             player.prepare();
             queueSignature = signature;

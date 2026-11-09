@@ -317,3 +317,19 @@ test('удаление папок плейлистов никогда не уд�
   assert.match(block, /deleteManagedPlaylistDirectories\(root\)/);
   assert.doesNotMatch(block, /root\.delete\(\)/);
 });
+
+
+test('Android native bridge is generated before Capacitor sync', () => {
+  const pkg = JSON.parse(read('package.json'));
+  assert.equal(pkg.scripts['preandroid:sync'], 'npm run prepare:android');
+  assert.match(read('scripts/prepare-android.js'), /function bundleBridge\(\)/);
+  assert.match(read('www/index.html'), /native-bridge\.bundle\.js/);
+});
+
+test('native queue updates preserve the active ExoPlayer item when only upcoming tracks change', () => {
+  const java = read('native/android/app/src/main/java/com/localify/crimson/PlaybackForegroundService.java');
+  assert.match(java, /samePrefixThroughCurrent/);
+  assert.match(java, /player\.removeMediaItems\(tailStart, player\.getMediaItemCount\(\)\)/);
+  assert.match(java, /player\.addMediaItems\(tailStart, mediaItems\.subList\(tailStart, mediaItems\.size\(\)\)\)/);
+  assert.match(java, /Replacing the whole timeline causes an audible micro-pause/);
+});
